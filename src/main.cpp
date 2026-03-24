@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "tsdfmc/dataset_io.h"
+#include "tsdfmc/reconstruction_backend.h"
 #include "tsdfmc/voxel_hash_tsdf.h"
 
 namespace fs = std::filesystem;
@@ -25,13 +26,14 @@ struct Options {
   int frames = 28;
   int width = 128;
   int height = 96;
-  float voxel_size = 0.001f;
-  float truncation = 0.003f;
+  float voxel_size = 0.003f;
+  float truncation = 0.009f;
   std::string dataset_root = TSDFMC_DEFAULT_DATASET_ROOT;
   int frame_start = 0;
   int frame_end = -1;
   int frame_step = 1;
   std::string pose_file = "pose.txt";
+  ComputeBackendPreference backend = ComputeBackendPreference::kAuto;
   bool synthetic = false;
 };
 
@@ -40,7 +42,7 @@ void printUsage(const char* argv0) {
             << " [--voxel-size s] [--truncation t]\n"
             << "       " << argv0
             << " [--dataset-root path] [--frame-start N] [--frame-end N] [--frame-step N]"
-            << " [--pose-file pose.txt|speckle_pose.txt] [--output path]\n";
+            << " [--pose-file pose.txt|speckle_pose.txt] [--backend auto|cpu|gpu] [--output path]\n";
   std::cout << "Default dataset root: " << TSDFMC_DEFAULT_DATASET_ROOT << '\n';
   std::cout << "Use --synthetic to run the synthetic demo instead of dataset reconstruction.\n";
 }
@@ -121,6 +123,10 @@ Options parseArgs(const int argc, char** argv) {
       }
     } else if (arg == "--pose-file") {
       options.pose_file = value;
+    } else if (arg == "--backend") {
+      if (!parseComputeBackendPreference(value, options.backend)) {
+        throw std::runtime_error("Invalid value for --backend (expected auto|cpu|gpu)");
+      }
     } else {
       printUsage(argv[0]);
       throw std::runtime_error("Unknown argument: " + arg);
@@ -351,11 +357,13 @@ int runSyntheticDemo(const Options& options) {
   intrinsics.cy = (static_cast<float>(options.height) - 1.0f) * 0.5f;
 
   VoxelHashTSDF volume(options.voxel_size, options.truncation);
+  const TsdfIntegrationBackend integration_backend(options.backend);
   std::mt19937 rng(42U);
 
   std::cout << "Mode: synthetic demo\n";
   std::cout << "Frames=" << options.frames << ", resolution=" << options.width << "x" << options.height
             << ", voxel_size=" << options.voxel_size << ", truncation=" << options.truncation << '\n';
+  std::cout << "Integration backend: " << integration_backend.description() << '\n';
 
   for (int i = 0; i < options.frames; ++i) {
     const float angle = 2.0f * kPi * static_cast<float>(i) /
@@ -368,14 +376,14 @@ int runSyntheticDemo(const Options& options) {
     };
     const Pose T_wc = makeLookAtPose(eye, Vec3f{0.08f, -0.02f, 0.0f});
     DepthFrame frame = renderSyntheticDepth(intrinsics, T_wc, i, rng);
-    volume.integrate(frame, T_wc, 2);
+    integration_backend.integrate(volume, frame, T_wc, 2);
 
     std::cout << "Frame " << (i + 1) << "/" << options.frames
               << " integrated, active blocks=" << volume.blockCount()
               << ", observed voxels=" << volume.observedVoxelCount() << '\n';
   }
 
-  const std::vector<Triangle> triangles = volume.extractMesh();
+  const std::vector<Triangle> triangles = integration_backend.extractMesh(volume);
   fs::path output_path = options.output_path;
   if (output_path.has_parent_path()) {
     fs::create_directories(output_path.parent_path());
@@ -432,6 +440,7 @@ int runDatasetReconstruction(const Options& options) {
   }
 
   VoxelHashTSDF volume(options.voxel_size, options.truncation);
+  const TsdfIntegrationBackend integration_backend(options.backend);
   std::cout << "Mode: dataset reconstruction\n";
   std::cout << "Dataset root: " << dataset_root << '\n';
   std::cout << "Intrinsics: fx=" << intrinsics.fx << ", fy=" << intrinsics.fy << ", cx=" << intrinsics.cx
@@ -440,6 +449,7 @@ int runDatasetReconstruction(const Options& options) {
   std::cout << "Frame selection: start=" << start_frame << ", end=" << end_frame
             << ", step=" << options.frame_step << ", count=" << selected_frame_ids.size() << '\n';
   std::cout << "Pose file: " << options.pose_file << '\n';
+  std::cout << "Integration backend: " << integration_backend.description() << '\n';
   std::cout << "Depth input: <frame_id>/depth.png\n";
 
   const std::size_t total_pixels =
@@ -452,14 +462,14 @@ int runDatasetReconstruction(const Options& options) {
 
     std::cout << "Loading frame " << frame_id << " (" << (i + 1) << "/" << selected_frame_ids.size()
               << "), valid_depth=" << frame.valid_depth_samples << "/" << total_pixels << '\n';
-    volume.integrate(frame.depth_frame, frame.T_wc, 2);
+    integration_backend.integrate(volume, frame.depth_frame, frame.T_wc, 2);
     std::cout << "Integrated frame " << frame_id
               << ", active blocks=" << volume.blockCount()
               << ", observed voxels=" << volume.observedVoxelCount() << '\n';
   }
 
   std::cout << "Extracting mesh with marching cubes...\n";
-  const std::vector<Triangle> triangles = volume.extractMesh();
+  const std::vector<Triangle> triangles = integration_backend.extractMesh(volume);
   fs::path output_path = options.output_path;
   if (output_path.has_parent_path()) {
     fs::create_directories(output_path.parent_path());

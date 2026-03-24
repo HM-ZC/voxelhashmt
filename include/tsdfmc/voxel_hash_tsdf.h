@@ -1,9 +1,11 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "tsdfmc/marching_cubes.h"
@@ -45,58 +47,17 @@ class VoxelHashTSDF {
     std::array<Voxel, kBlockVolume> voxels{};
   };
 
+  struct FlatBlockRecord {
+    BlockKey key;
+    Voxel voxels[kBlockVolume];
+  };
+
   VoxelHashTSDF(const float voxel_size, const float truncation_distance)
       : voxel_size_(voxel_size), truncation_distance_(truncation_distance) {}
 
   void integrate(const DepthFrame& frame, const Pose& T_wc, const int allocation_stride = 1) {
-    allocateBlocksForFrame(frame, T_wc, allocation_stride);
-
-    const Pose T_cw = T_wc.inverse();
-    for (auto& entry : blocks_) {
-      const BlockKey& block_key = entry.first;
-      Block& block = entry.second;
-      const int base_x = block_key.x * kBlockSize;
-      const int base_y = block_key.y * kBlockSize;
-      const int base_z = block_key.z * kBlockSize;
-
-      for (int lz = 0; lz < kBlockSize; ++lz) {
-        for (int ly = 0; ly < kBlockSize; ++ly) {
-          for (int lx = 0; lx < kBlockSize; ++lx) {
-            const Vec3i voxel_coord{base_x + lx, base_y + ly, base_z + lz};
-            const Vec3f point_w = voxelToWorld(voxel_coord);
-            const Vec3f point_c = T_cw.transformPoint(point_w);
-            if (point_c.z <= 0.0f) {
-              continue;
-            }
-
-            float u = 0.0f;
-            float v = 0.0f;
-            if (!projectPoint(point_c, frame.intrinsics, u, v)) {
-              continue;
-            }
-
-            float depth = 0.0f;
-            if (!sampleDepthNearest(frame, u, v, depth)) {
-              continue;
-            }
-
-            const float signed_distance = depth - point_c.z;
-            if (signed_distance <= -truncation_distance_) {
-              continue;
-            }
-
-            const float tsdf = clampf(signed_distance / truncation_distance_, -1.0f, 1.0f);
-            const int index = localIndexFromCoords(lx, ly, lz);
-            Voxel& voxel = block.voxels[static_cast<std::size_t>(index)];
-
-            constexpr float observation_weight = 1.0f;
-            const float new_weight = std::min(100.0f, voxel.weight + observation_weight);
-            voxel.tsdf = (voxel.tsdf * voxel.weight + tsdf * observation_weight) / new_weight;
-            voxel.weight = new_weight;
-          }
-        }
-      }
-    }
+    const std::vector<BlockKey> active_blocks = prepareFrameIntegration(frame, T_wc, allocation_stride);
+    integrateBlocks(active_blocks, frame, T_wc);
   }
 
   void integratePointCloud(const std::vector<Vec3f>& points_c, const Pose& T_wc) {
@@ -182,10 +143,84 @@ class VoxelHashTSDF {
     return count;
   }
 
+  float voxelSize() const {
+    return voxel_size_;
+  }
+
+  float truncationDistance() const {
+    return truncation_distance_;
+  }
+
+  std::vector<BlockKey> prepareFrameIntegration(const DepthFrame& frame,
+                                                const Pose& T_wc,
+                                                const int allocation_stride = 1) {
+    const std::vector<BlockKey> active_blocks = collectBlocksForFrame(frame, T_wc, allocation_stride);
+    ensureBlocksExist(active_blocks);
+    return active_blocks;
+  }
+
+  void ensureBlocksExist(const std::vector<BlockKey>& block_keys) {
+    for (const BlockKey& key : block_keys) {
+      blocks_.try_emplace(key);
+    }
+  }
+
+  std::vector<FlatBlockRecord> copyBlocksToFlat(const std::vector<BlockKey>& block_keys) const {
+    std::vector<FlatBlockRecord> flat_blocks;
+    flat_blocks.reserve(block_keys.size());
+
+    for (const BlockKey& key : block_keys) {
+      const auto it = blocks_.find(key);
+      if (it == blocks_.end()) {
+        continue;
+      }
+
+      FlatBlockRecord record{};
+      record.key = key;
+      std::copy_n(it->second.voxels.begin(), kBlockVolume, record.voxels);
+      flat_blocks.push_back(record);
+    }
+
+    return flat_blocks;
+  }
+
+  std::vector<BlockKey> observedBlockKeys() const {
+    std::vector<BlockKey> keys;
+    keys.reserve(blocks_.size());
+
+    for (const auto& entry : blocks_) {
+      if (blockHasObservedVoxels(entry.second)) {
+        keys.push_back(entry.first);
+      }
+    }
+
+    return keys;
+  }
+
+  std::vector<FlatBlockRecord> copyObservedBlocksToFlat() const {
+    return copyBlocksToFlat(observedBlockKeys());
+  }
+
+  void applyFlatBlocks(const std::vector<FlatBlockRecord>& flat_blocks) {
+    for (const FlatBlockRecord& record : flat_blocks) {
+      Block& block = blocks_[record.key];
+      std::copy_n(record.voxels, kBlockVolume, block.voxels.begin());
+    }
+  }
+
  private:
   float voxel_size_ = 0.02f;
   float truncation_distance_ = 0.06f;
   std::unordered_map<BlockKey, Block, BlockKeyHash> blocks_;
+
+  static bool blockHasObservedVoxels(const Block& block) {
+    for (const Voxel& voxel : block.voxels) {
+      if (voxel.weight > 0.0f) {
+        return true;
+      }
+    }
+    return false;
+  }
 
   static int floorDiv(const int value, const int divisor) {
     int quotient = value / divisor;
@@ -239,20 +274,24 @@ class VoxelHashTSDF {
     return localIndexFromCoords(lx, ly, lz);
   }
 
-  void allocateNeighborhood(const BlockKey& center_key) {
+  void collectNeighborhood(const BlockKey& center_key,
+                           std::unordered_set<BlockKey, BlockKeyHash>& active_blocks) const {
     for (int dz = -1; dz <= 1; ++dz) {
       for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
           const BlockKey key{center_key.x + dx, center_key.y + dy, center_key.z + dz};
-          blocks_.try_emplace(key);
+          active_blocks.insert(key);
         }
       }
     }
   }
 
-  void allocateBlocksForFrame(const DepthFrame& frame, const Pose& T_wc, const int allocation_stride) {
+  std::vector<BlockKey> collectBlocksForFrame(const DepthFrame& frame,
+                                              const Pose& T_wc,
+                                              const int allocation_stride) const {
     const int stride = std::max(1, allocation_stride);
     const Vec3f camera_origin = T_wc.t;
+    std::unordered_set<BlockKey, BlockKeyHash> active_blocks;
 
     for (int v = 0; v < frame.intrinsics.height; v += stride) {
       for (int u = 0; u < frame.intrinsics.width; u += stride) {
@@ -268,11 +307,18 @@ class VoxelHashTSDF {
         const Vec3f front_point = point_w - ray_world * truncation_distance_;
         const Vec3f back_point = point_w + ray_world * truncation_distance_;
 
-        allocateNeighborhood(voxelToBlockKey(worldToVoxel(point_w)));
-        allocateNeighborhood(voxelToBlockKey(worldToVoxel(front_point)));
-        allocateNeighborhood(voxelToBlockKey(worldToVoxel(back_point)));
+        collectNeighborhood(voxelToBlockKey(worldToVoxel(point_w)), active_blocks);
+        collectNeighborhood(voxelToBlockKey(worldToVoxel(front_point)), active_blocks);
+        collectNeighborhood(voxelToBlockKey(worldToVoxel(back_point)), active_blocks);
       }
     }
+
+    std::vector<BlockKey> keys;
+    keys.reserve(active_blocks.size());
+    for (const BlockKey& key : active_blocks) {
+      keys.push_back(key);
+    }
+    return keys;
   }
 
   bool sampleDepthNearest(const DepthFrame& frame, const float u, const float v, float& depth) const {
@@ -308,6 +354,59 @@ class VoxelHashTSDF {
     const float new_weight = std::min(100.0f, voxel.weight + observation_weight);
     voxel.tsdf = (voxel.tsdf * voxel.weight + tsdf * observation_weight) / new_weight;
     voxel.weight = new_weight;
+  }
+
+  void integrateBlocks(const std::vector<BlockKey>& active_blocks, const DepthFrame& frame, const Pose& T_wc) {
+    const Pose T_cw = T_wc.inverse();
+    for (const BlockKey& block_key : active_blocks) {
+      auto it = blocks_.find(block_key);
+      if (it == blocks_.end()) {
+        continue;
+      }
+
+      Block& block = it->second;
+      const int base_x = block_key.x * kBlockSize;
+      const int base_y = block_key.y * kBlockSize;
+      const int base_z = block_key.z * kBlockSize;
+
+      for (int lz = 0; lz < kBlockSize; ++lz) {
+        for (int ly = 0; ly < kBlockSize; ++ly) {
+          for (int lx = 0; lx < kBlockSize; ++lx) {
+            const Vec3i voxel_coord{base_x + lx, base_y + ly, base_z + lz};
+            const Vec3f point_w = voxelToWorld(voxel_coord);
+            const Vec3f point_c = T_cw.transformPoint(point_w);
+            if (point_c.z <= 0.0f) {
+              continue;
+            }
+
+            float u = 0.0f;
+            float v = 0.0f;
+            if (!projectPoint(point_c, frame.intrinsics, u, v)) {
+              continue;
+            }
+
+            float depth = 0.0f;
+            if (!sampleDepthNearest(frame, u, v, depth)) {
+              continue;
+            }
+
+            const float signed_distance = depth - point_c.z;
+            if (signed_distance <= -truncation_distance_) {
+              continue;
+            }
+
+            const float tsdf = clampf(signed_distance / truncation_distance_, -1.0f, 1.0f);
+            const int index = localIndexFromCoords(lx, ly, lz);
+            Voxel& voxel = block.voxels[static_cast<std::size_t>(index)];
+
+            constexpr float observation_weight = 1.0f;
+            const float new_weight = std::min(100.0f, voxel.weight + observation_weight);
+            voxel.tsdf = (voxel.tsdf * voxel.weight + tsdf * observation_weight) / new_weight;
+            voxel.weight = new_weight;
+          }
+        }
+      }
+    }
   }
 };
 
