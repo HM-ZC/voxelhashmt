@@ -15,7 +15,7 @@
 ## 目录结构
 
 - `include/tsdfmc/math_types.h`: 基础向量、旋转、位姿、相机模型
-- `include/tsdfmc/dataset_io.h`: `hualaohu2shanchanzi-20260210` 数据集读取
+- `include/tsdfmc/dataset_io.h`: `datasets` 深度图数据集读取
 - `include/tsdfmc/marching_cubes.h`: Marching Cubes 查表与单体素格三角化
 - `include/tsdfmc/voxel_hash_tsdf.h`: 稀疏哈希 TSDF 融合与网格提取
 - `src/main.cpp`: 合成深度序列、融合流程、PLY 导出、CLI
@@ -54,16 +54,17 @@ cmake --build build -j
 
 默认会：
 
-1. 生成一组围绕目标物体运动的合成深度帧
-2. 注入条纹偏置、随机噪声和少量缺失点，模拟散斑深度传感器输出
+1. 使用硬编码到程序中的 `datasets` 目录
+2. 逐帧读取 `depth.png + pose.txt`
 3. 将深度帧融合进稀疏 TSDF
 4. 用 Marching Cubes 提取网格
 5. 输出到 `output/reconstruction.ply`
 
-可以自定义参数：
+如果想运行旧的合成深度示例：
 
 ```bash
 ./build/tsdf_voxel_hash_demo \
+  --synthetic \
   --output output/demo_mesh.ply \
   --frames 36 \
   --width 160 \
@@ -72,41 +73,40 @@ cmake --build build -j
   --truncation 0.05
 ```
 
-## 读取 `hualaohu2shanchanzi-20260210` 数据集
+## 读取 `datasets` 深度图数据集
 
-这个仓库已经支持直接读取 [hualaohu2shanchanzi-20260210](/root/tsdfmc/hualaohu2shanchanzi-20260210) 中已确认格式的文件：
+这个仓库已经支持直接读取仓库根目录下 `datasets` 中的文件：
 
-- `opt_result/intrinsic.txt`
-- `opt_result/<frame_id>/pose.txt`
-- `opt_result/<frame_id>/speckle_pose.txt`
-- `opt_result/<frame_id>/laser_points.txt`
+- `datasets/intrinsic.txt`
+- `datasets/<frame_id>/pose.txt`
+- `datasets/<frame_id>/speckle_pose.txt`
+- `datasets/<frame_id>/depth.png`
 
 注意：
 
-- `opt_result/<frame_id>/depth.png` 不是标准 PNG，而是一个带 `%TSD-Header-###%` 头的私有二进制文件。
-- 当前版本没有解码这个私有深度文件，而是直接使用 `laser_points.txt` 进行 TSDF 融合。
+- `depth.png` 是标准 16-bit 深度 PNG
+- 深度值会按 `intrinsic.txt` 里的 `depth_scale` 转成米
+- 默认数据集路径会在编译时硬编码成当前仓库的 `datasets`
 - 程序会打印逐帧加载和融合日志。
 
 示例：
 
 ```bash
 ./build/tsdf_voxel_hash_demo \
-  --dataset-root /root/tsdfmc/hualaohu2shanchanzi-20260210 \
   --frame-start 0 \
   --frame-end 200 \
   --frame-step 20 \
   --pose-file pose.txt \
-  --output output/hualaohu_0_200_step20.ply
+  --output output/datasets_0_200_step20.ply
 ```
 
 如果想改用 `speckle_pose.txt`：
 
 ```bash
 ./build/tsdf_voxel_hash_demo \
-  --dataset-root /root/tsdfmc/hualaohu2shanchanzi-20260210 \
   --frame-step 10 \
   --pose-file speckle_pose.txt \
-  --output output/hualaohu_speckle_pose.ply
+  --output output/datasets_speckle_pose.ply
 ```
 
 推荐先从较大的 `frame-step` 开始，例如 `10` 或 `20`，确认结果后再减小步长。
@@ -157,9 +157,9 @@ python3 tools/visualize_ply.py \
 
 数据集模式下：
 
-- 直接读取 `laser_points.txt` 中的局部点云
-- 结合 `pose.txt` 或 `speckle_pose.txt` 将点云射线变换到世界坐标
-- 沿观测射线的截断带更新体素 TSDF
+- 直接读取 `depth.png` 中的 16-bit 深度图
+- 用 `intrinsic.txt` 中的相机内参与深度缩放恢复米制深度
+- 结合 `pose.txt` 或 `speckle_pose.txt` 将深度帧融合到世界坐标系下的 TSDF
 
 ### 3. Marching Cubes
 
@@ -172,8 +172,7 @@ python3 tools/visualize_ply.py \
 - 只做 CPU 融合，没有做并行优化
 - 深度采样使用最近邻，没有做双线性插值
 - 网格导出为了简单起见，按三角形直接复制顶点，没有做顶点去重
-- 当前已接入 `hualaohu2shanchanzi-20260210` 中的 `laser_points.txt + pose.txt/speckle_pose.txt`，但还没有做通用数据集适配层
-- 尚未解码该数据集中的私有 `depth.png`
+- 数据集深度 PNG 解码当前走 Windows WIC 路径
 
 ## 后续扩展建议
 

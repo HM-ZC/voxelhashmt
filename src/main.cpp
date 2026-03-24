@@ -4,6 +4,7 @@
 #include <iostream>
 #include <limits>
 #include <random>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -15,26 +16,33 @@ using namespace tsdfmc;
 
 namespace {
 
+#ifndef TSDFMC_DEFAULT_DATASET_ROOT
+#define TSDFMC_DEFAULT_DATASET_ROOT "datasets"
+#endif
+
 struct Options {
   std::string output_path = "output/reconstruction.ply";
   int frames = 28;
   int width = 128;
   int height = 96;
-  float voxel_size = 0.02f;
-  float truncation = 0.06f;
-  std::string dataset_root;
+  float voxel_size = 0.001f;
+  float truncation = 0.003f;
+  std::string dataset_root = TSDFMC_DEFAULT_DATASET_ROOT;
   int frame_start = 0;
   int frame_end = -1;
   int frame_step = 1;
   std::string pose_file = "pose.txt";
+  bool synthetic = false;
 };
 
 void printUsage(const char* argv0) {
   std::cout << "Usage: " << argv0 << " [--output path] [--frames N] [--width W] [--height H]"
             << " [--voxel-size s] [--truncation t]\n"
             << "       " << argv0
-            << " --dataset-root path [--frame-start N] [--frame-end N] [--frame-step N]"
+            << " [--dataset-root path] [--frame-start N] [--frame-end N] [--frame-step N]"
             << " [--pose-file pose.txt|speckle_pose.txt] [--output path]\n";
+  std::cout << "Default dataset root: " << TSDFMC_DEFAULT_DATASET_ROOT << '\n';
+  std::cout << "Use --synthetic to run the synthetic demo instead of dataset reconstruction.\n";
 }
 
 bool parseIntArg(const std::string& value, int& out) {
@@ -62,6 +70,11 @@ Options parseArgs(const int argc, char** argv) {
     if (arg == "--help" || arg == "-h") {
       printUsage(argv[0]);
       std::exit(0);
+    }
+
+    if (arg == "--synthetic") {
+      options.synthetic = true;
+      continue;
     }
 
     if (i + 1 >= argc) {
@@ -116,6 +129,29 @@ Options parseArgs(const int argc, char** argv) {
 
   return options;
 }
+
+#if defined(_WIN32)
+class ScopedComInitializer {
+ public:
+  ScopedComInitializer() {
+    hr_ = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(hr_) && hr_ != RPC_E_CHANGED_MODE) {
+      std::ostringstream oss;
+      oss << "CoInitializeEx failed with HRESULT=0x" << std::hex << static_cast<unsigned long>(hr_);
+      throw std::runtime_error(oss.str());
+    }
+  }
+
+  ~ScopedComInitializer() {
+    if (hr_ == S_OK || hr_ == S_FALSE) {
+      CoUninitialize();
+    }
+  }
+
+ private:
+  HRESULT hr_ = S_OK;
+};
+#endif
 
 Pose makeLookAtPose(const Vec3f& eye, const Vec3f& target) {
   const Vec3f world_up{0.0f, 1.0f, 0.0f};
@@ -359,19 +395,18 @@ int runSyntheticDemo(const Options& options) {
 
 int runDatasetReconstruction(const Options& options) {
   const fs::path dataset_root = options.dataset_root;
-  const fs::path opt_result_dir = dataset_root / "opt_result";
-  const fs::path intrinsic_path = opt_result_dir / "intrinsic.txt";
+  const fs::path intrinsic_path = dataset_root / "intrinsic.txt";
 
-  if (!fs::exists(opt_result_dir)) {
-    std::cerr << "Dataset directory not found: " << opt_result_dir << '\n';
+  if (!fs::exists(dataset_root)) {
+    std::cerr << "Dataset directory not found: " << dataset_root << '\n';
     return 1;
   }
 
   float depth_scale = 0.0f;
   const Intrinsics intrinsics = loadDatasetIntrinsics(intrinsic_path, depth_scale);
-  const std::vector<int> frame_ids = listDatasetFrameIds(opt_result_dir);
+  const std::vector<int> frame_ids = listDatasetFrameIds(dataset_root);
   if (frame_ids.empty()) {
-    std::cerr << "No frame directories found under " << opt_result_dir << '\n';
+    std::cerr << "No frame directories found under " << dataset_root << '\n';
     return 1;
   }
 
@@ -405,16 +440,19 @@ int runDatasetReconstruction(const Options& options) {
   std::cout << "Frame selection: start=" << start_frame << ", end=" << end_frame
             << ", step=" << options.frame_step << ", count=" << selected_frame_ids.size() << '\n';
   std::cout << "Pose file: " << options.pose_file << '\n';
-  std::cout << "Depth note: opt_result/*/depth.png uses a custom TSD header and is not decoded here; "
-               "integration uses laser_points.txt.\n";
+  std::cout << "Depth input: <frame_id>/depth.png\n";
+
+  const std::size_t total_pixels =
+      static_cast<std::size_t>(intrinsics.width) * static_cast<std::size_t>(intrinsics.height);
 
   for (std::size_t i = 0; i < selected_frame_ids.size(); ++i) {
     const int frame_id = selected_frame_ids[i];
-    const LaserScanFrame frame = loadLaserScanFrame(opt_result_dir, frame_id, options.pose_file);
+    const DatasetFrame frame =
+        loadDatasetDepthFrame(dataset_root, frame_id, options.pose_file, intrinsics, depth_scale);
 
     std::cout << "Loading frame " << frame_id << " (" << (i + 1) << "/" << selected_frame_ids.size()
-              << "), points=" << frame.points_c.size() << '\n';
-    volume.integratePointCloud(frame.points_c, frame.T_wc);
+              << "), valid_depth=" << frame.valid_depth_samples << "/" << total_pixels << '\n';
+    volume.integrate(frame.depth_frame, frame.T_wc, 2);
     std::cout << "Integrated frame " << frame_id
               << ", active blocks=" << volume.blockCount()
               << ", observed voxels=" << volume.observedVoxelCount() << '\n';
@@ -444,9 +482,16 @@ int runDatasetReconstruction(const Options& options) {
 int main(int argc, char** argv) {
   try {
     const Options options = parseArgs(argc, argv);
-    if (!options.dataset_root.empty()) {
+#if defined(_WIN32)
+    if (!options.synthetic) {
+      const ScopedComInitializer com_initializer;
       return runDatasetReconstruction(options);
     }
+#else
+    if (!options.synthetic) {
+      return runDatasetReconstruction(options);
+    }
+#endif
     return runSyntheticDemo(options);
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';

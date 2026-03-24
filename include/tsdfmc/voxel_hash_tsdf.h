@@ -48,7 +48,7 @@ class VoxelHashTSDF {
   VoxelHashTSDF(const float voxel_size, const float truncation_distance)
       : voxel_size_(voxel_size), truncation_distance_(truncation_distance) {}
 
-  void integrate(const DepthFrame& frame, const Pose& T_wc, const int allocation_stride = 2) {
+  void integrate(const DepthFrame& frame, const Pose& T_wc, const int allocation_stride = 1) {
     allocateBlocksForFrame(frame, T_wc, allocation_stride);
 
     const Pose T_cw = T_wc.inverse();
