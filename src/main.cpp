@@ -1,6 +1,8 @@
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <random>
@@ -16,6 +18,9 @@ namespace fs = std::filesystem;
 using namespace tsdfmc;
 
 namespace {
+
+using Clock = std::chrono::steady_clock;
+using Milliseconds = std::chrono::duration<double, std::milli>;
 
 #ifndef TSDFMC_DEFAULT_DATASET_ROOT
 #define TSDFMC_DEFAULT_DATASET_ROOT "datasets"
@@ -36,6 +41,12 @@ struct Options {
   ComputeBackendPreference backend = ComputeBackendPreference::kAuto;
   bool synthetic = false;
 };
+
+std::string formatMilliseconds(const Milliseconds duration) {
+  std::ostringstream oss;
+  oss << std::fixed << std::setprecision(3) << duration.count() << " ms";
+  return oss.str();
+}
 
 void printUsage(const char* argv0) {
   std::cout << "Usage: " << argv0 << " [--output path] [--frames N] [--width W] [--height H]"
@@ -347,6 +358,7 @@ bool writeMeshAsPly(const fs::path& path, const std::vector<Triangle>& triangles
 
 int runSyntheticDemo(const Options& options) {
   constexpr float kPi = 3.14159265358979323846f;
+  const Clock::time_point process_start = Clock::now();
 
   Intrinsics intrinsics;
   intrinsics.width = options.width;
@@ -365,7 +377,11 @@ int runSyntheticDemo(const Options& options) {
             << ", voxel_size=" << options.voxel_size << ", truncation=" << options.truncation << '\n';
   std::cout << "Integration backend: " << integration_backend.description() << '\n';
 
+  Milliseconds render_total{0.0};
+  Milliseconds integrate_total{0.0};
+
   for (int i = 0; i < options.frames; ++i) {
+    const Clock::time_point frame_start = Clock::now();
     const float angle = 2.0f * kPi * static_cast<float>(i) /
                         static_cast<float>(std::max(1, options.frames));
     const float radius = 1.15f;
@@ -375,33 +391,55 @@ int runSyntheticDemo(const Options& options) {
         radius * std::sin(angle),
     };
     const Pose T_wc = makeLookAtPose(eye, Vec3f{0.08f, -0.02f, 0.0f});
+    const Clock::time_point render_start = Clock::now();
     DepthFrame frame = renderSyntheticDepth(intrinsics, T_wc, i, rng);
+    const Milliseconds render_elapsed = Clock::now() - render_start;
+    render_total += render_elapsed;
+
+    const Clock::time_point integrate_start = Clock::now();
     integration_backend.integrate(volume, frame, T_wc, 2);
+    const Milliseconds integrate_elapsed = Clock::now() - integrate_start;
+    integrate_total += integrate_elapsed;
+    const Milliseconds frame_elapsed = Clock::now() - frame_start;
 
     std::cout << "Frame " << (i + 1) << "/" << options.frames
-              << " integrated, active blocks=" << volume.blockCount()
+              << " rendered in " << formatMilliseconds(render_elapsed)
+              << ", integrated in " << formatMilliseconds(integrate_elapsed)
+              << ", total=" << formatMilliseconds(frame_elapsed)
+              << ", active blocks=" << volume.blockCount()
               << ", observed voxels=" << volume.observedVoxelCount() << '\n';
   }
 
+  const Clock::time_point mesh_start = Clock::now();
   const std::vector<Triangle> triangles = integration_backend.extractMesh(volume);
+  const Milliseconds mesh_elapsed = Clock::now() - mesh_start;
   fs::path output_path = options.output_path;
   if (output_path.has_parent_path()) {
     fs::create_directories(output_path.parent_path());
   }
 
+  const Clock::time_point write_start = Clock::now();
   if (!writeMeshAsPly(output_path, triangles)) {
     std::cerr << "Failed to write mesh to " << output_path << '\n';
     return 1;
   }
+  const Milliseconds write_elapsed = Clock::now() - write_start;
+  const Milliseconds total_elapsed = Clock::now() - process_start;
 
   std::cout << "Mesh written to " << output_path << '\n';
   std::cout << "Final stats: blocks=" << volume.blockCount()
             << ", observed voxels=" << volume.observedVoxelCount()
             << ", raw triangles=" << triangles.size() << '\n';
+  std::cout << "Timing summary: render=" << formatMilliseconds(render_total)
+            << ", integrate=" << formatMilliseconds(integrate_total)
+            << ", mesh_extract=" << formatMilliseconds(mesh_elapsed)
+            << ", mesh_write=" << formatMilliseconds(write_elapsed)
+            << ", total=" << formatMilliseconds(total_elapsed) << '\n';
   return 0;
 }
 
 int runDatasetReconstruction(const Options& options) {
+  const Clock::time_point process_start = Clock::now();
   const fs::path dataset_root = options.dataset_root;
   const fs::path intrinsic_path = dataset_root / "intrinsic.txt";
 
@@ -455,35 +493,60 @@ int runDatasetReconstruction(const Options& options) {
   const std::size_t total_pixels =
       static_cast<std::size_t>(intrinsics.width) * static_cast<std::size_t>(intrinsics.height);
 
+  Milliseconds load_total{0.0};
+  Milliseconds integrate_total{0.0};
+
   for (std::size_t i = 0; i < selected_frame_ids.size(); ++i) {
+    const Clock::time_point frame_start = Clock::now();
     const int frame_id = selected_frame_ids[i];
+    const Clock::time_point load_start = Clock::now();
     const DatasetFrame frame =
         loadDatasetDepthFrame(dataset_root, frame_id, options.pose_file, intrinsics, depth_scale);
+    const Milliseconds load_elapsed = Clock::now() - load_start;
+    load_total += load_elapsed;
 
     std::cout << "Loading frame " << frame_id << " (" << (i + 1) << "/" << selected_frame_ids.size()
               << "), valid_depth=" << frame.valid_depth_samples << "/" << total_pixels << '\n';
+
+    const Clock::time_point integrate_start = Clock::now();
     integration_backend.integrate(volume, frame.depth_frame, frame.T_wc, 2);
+    const Milliseconds integrate_elapsed = Clock::now() - integrate_start;
+    integrate_total += integrate_elapsed;
+    const Milliseconds frame_elapsed = Clock::now() - frame_start;
     std::cout << "Integrated frame " << frame_id
+              << ", load=" << formatMilliseconds(load_elapsed)
+              << ", integrate=" << formatMilliseconds(integrate_elapsed)
+              << ", total=" << formatMilliseconds(frame_elapsed)
               << ", active blocks=" << volume.blockCount()
               << ", observed voxels=" << volume.observedVoxelCount() << '\n';
   }
 
   std::cout << "Extracting mesh with marching cubes...\n";
+  const Clock::time_point mesh_start = Clock::now();
   const std::vector<Triangle> triangles = integration_backend.extractMesh(volume);
+  const Milliseconds mesh_elapsed = Clock::now() - mesh_start;
   fs::path output_path = options.output_path;
   if (output_path.has_parent_path()) {
     fs::create_directories(output_path.parent_path());
   }
 
+  const Clock::time_point write_start = Clock::now();
   if (!writeMeshAsPly(output_path, triangles)) {
     std::cerr << "Failed to write mesh to " << output_path << '\n';
     return 1;
   }
+  const Milliseconds write_elapsed = Clock::now() - write_start;
+  const Milliseconds total_elapsed = Clock::now() - process_start;
 
   std::cout << "Mesh written to " << output_path << '\n';
   std::cout << "Final stats: blocks=" << volume.blockCount()
             << ", observed voxels=" << volume.observedVoxelCount()
             << ", raw triangles=" << triangles.size() << '\n';
+  std::cout << "Timing summary: frame_load=" << formatMilliseconds(load_total)
+            << ", integrate=" << formatMilliseconds(integrate_total)
+            << ", mesh_extract=" << formatMilliseconds(mesh_elapsed)
+            << ", mesh_write=" << formatMilliseconds(write_elapsed)
+            << ", total=" << formatMilliseconds(total_elapsed) << '\n';
   return 0;
 }
 
