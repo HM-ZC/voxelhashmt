@@ -33,23 +33,103 @@ struct DatasetFrame {
   std::size_t valid_depth_samples = 0;
 };
 
-inline Intrinsics loadDatasetIntrinsics(const fs::path& path, float& depth_scale) {
+inline std::vector<int> listDatasetFrameIds(const fs::path& dataset_root);
+
+inline std::vector<double> readNumericValuesFromFile(const fs::path& path) {
   std::ifstream input(path);
   if (!input) {
-    throw std::runtime_error("Failed to open intrinsic file: " + path.string());
+    throw std::runtime_error("Failed to open metadata file: " + path.string());
   }
 
-  float width = 0.0f;
-  float height = 0.0f;
-  Intrinsics intrinsics;
-  if (!(input >> intrinsics.fx >> intrinsics.fy >> intrinsics.cx >> intrinsics.cy >> width >> height >>
-        depth_scale)) {
-    throw std::runtime_error("Failed to parse intrinsic file: " + path.string());
+  std::vector<double> values;
+  double value = 0.0;
+  while (input >> value) {
+    values.push_back(value);
   }
 
-  intrinsics.width = static_cast<int>(width);
-  intrinsics.height = static_cast<int>(height);
-  return intrinsics;
+  if (values.empty()) {
+    throw std::runtime_error("Failed to parse numeric metadata from file: " + path.string());
+  }
+
+  return values;
+}
+
+inline fs::path resolveDatasetRootFromMetadataPath(const fs::path& metadata_path) {
+  if (metadata_path.filename() == "params.txt") {
+    return metadata_path.parent_path().parent_path();
+  }
+  return metadata_path.parent_path();
+}
+
+inline fs::path findDatasetIntrinsicsMetadataPath(const fs::path& preferred_path) {
+  if (fs::exists(preferred_path)) {
+    return preferred_path;
+  }
+
+  const fs::path dataset_root = preferred_path.parent_path();
+  for (const int frame_id : listDatasetFrameIds(dataset_root)) {
+    const fs::path params_path = dataset_root / std::to_string(frame_id) / "params.txt";
+    if (fs::exists(params_path)) {
+      return params_path;
+    }
+  }
+
+  throw std::runtime_error("Failed to locate dataset intrinsics metadata. Expected " + preferred_path.string() +
+                           " or <frame>/params.txt under " + dataset_root.string());
+}
+
+inline fs::path findFirstDatasetDepthImage(const fs::path& dataset_root) {
+  for (const int frame_id : listDatasetFrameIds(dataset_root)) {
+    const fs::path depth_path = dataset_root / std::to_string(frame_id) / "depth.png";
+    if (fs::exists(depth_path)) {
+      return depth_path;
+    }
+  }
+
+  throw std::runtime_error("Failed to locate any dataset depth.png under " + dataset_root.string());
+}
+
+inline bool parseIntrinsicsMetadataValues(const std::vector<double>& values,
+                                          const fs::path& source_path,
+                                          Intrinsics& intrinsics,
+                                          float& depth_scale,
+                                          bool& has_resolution) {
+  has_resolution = false;
+  if (values.size() == 7U) {
+    intrinsics.fx = static_cast<float>(values[0]);
+    intrinsics.fy = static_cast<float>(values[1]);
+    intrinsics.cx = static_cast<float>(values[2]);
+    intrinsics.cy = static_cast<float>(values[3]);
+    intrinsics.width = static_cast<int>(values[4]);
+    intrinsics.height = static_cast<int>(values[5]);
+    depth_scale = static_cast<float>(values[6]);
+    has_resolution = true;
+    return true;
+  }
+
+  if (values.size() == 5U) {
+    intrinsics.fx = static_cast<float>(values[0]);
+    intrinsics.fy = static_cast<float>(values[1]);
+    intrinsics.cx = static_cast<float>(values[2]);
+    intrinsics.cy = static_cast<float>(values[3]);
+    depth_scale = static_cast<float>(values[4]);
+    return true;
+  }
+
+  if (values.size() == 6U) {
+    intrinsics.fx = static_cast<float>(values[0]);
+    intrinsics.fy = static_cast<float>(values[1]);
+    intrinsics.cx = static_cast<float>(values[2]);
+    intrinsics.cy = static_cast<float>(values[3]);
+    intrinsics.width = static_cast<int>(values[4]);
+    intrinsics.height = static_cast<int>(values[5]);
+    depth_scale = 1.0f;
+    has_resolution = true;
+    return true;
+  }
+
+  throw std::runtime_error("Unsupported intrinsics metadata format in " + source_path.string() +
+                           " (expected 5, 6, or 7 numeric values)");
 }
 
 inline std::vector<int> listDatasetFrameIds(const fs::path& dataset_root) {
@@ -72,19 +152,39 @@ inline std::vector<int> listDatasetFrameIds(const fs::path& dataset_root) {
 }
 
 inline Pose loadPoseFromFile(const fs::path& path) {
-  std::ifstream input(path);
-  if (!input) {
-    throw std::runtime_error("Failed to open pose file: " + path.string());
+  const std::vector<double> values = readNumericValuesFromFile(path);
+
+  if (values.size() == 7U) {
+    Quaternionf q;
+    Pose pose;
+    q.w = static_cast<float>(values[0]);
+    q.x = static_cast<float>(values[1]);
+    q.y = static_cast<float>(values[2]);
+    q.z = static_cast<float>(values[3]);
+    pose.t.x = static_cast<float>(values[4]);
+    pose.t.y = static_cast<float>(values[5]);
+    pose.t.z = static_cast<float>(values[6]);
+    pose.R = quaternionToMatrix(q);
+    return pose;
   }
 
-  Quaternionf q;
-  Pose pose;
-  if (!(input >> q.w >> q.x >> q.y >> q.z >> pose.t.x >> pose.t.y >> pose.t.z)) {
-    throw std::runtime_error("Failed to parse pose file: " + path.string());
+  if (values.size() == 12U || values.size() == 16U) {
+    Pose pose;
+    pose.R.data = {
+        static_cast<float>(values[0]), static_cast<float>(values[1]), static_cast<float>(values[2]),
+        static_cast<float>(values[4]), static_cast<float>(values[5]), static_cast<float>(values[6]),
+        static_cast<float>(values[8]), static_cast<float>(values[9]), static_cast<float>(values[10]),
+    };
+    pose.t = {
+        static_cast<float>(values[3]),
+        static_cast<float>(values[7]),
+        static_cast<float>(values[11]),
+    };
+    return pose;
   }
 
-  pose.R = quaternionToMatrix(q);
-  return pose;
+  throw std::runtime_error("Unsupported pose format in " + path.string() +
+                           " (expected 7, 12, or 16 numeric values)");
 }
 
 template <typename T>
@@ -137,6 +237,42 @@ inline void throwWicError(const std::string& action, const fs::path& path, const
   throw std::runtime_error(makeDecodeError(action, path, formatHresult(hr)));
 }
 
+inline Intrinsics completeIntrinsicsResolutionFromDepth(const Intrinsics& intrinsics_hint, const fs::path& depth_path) {
+  ScopedComPtr<IWICImagingFactory> factory;
+  HRESULT hr = CoCreateInstance(
+      CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, __uuidof(IWICImagingFactory),
+      reinterpret_cast<void**>(factory.put()));
+  if (FAILED(hr)) {
+    throwWicError("Failed to create WIC imaging factory", depth_path, hr);
+  }
+
+  ScopedComPtr<IWICBitmapDecoder> decoder;
+  const std::wstring wide_path = depth_path.wstring();
+  hr = factory.get()->CreateDecoderFromFilename(
+      wide_path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, decoder.put());
+  if (FAILED(hr)) {
+    throwWicError("Failed to open depth PNG", depth_path, hr);
+  }
+
+  ScopedComPtr<IWICBitmapFrameDecode> source_frame;
+  hr = decoder.get()->GetFrame(0, source_frame.put());
+  if (FAILED(hr)) {
+    throwWicError("Failed to access depth PNG frame", depth_path, hr);
+  }
+
+  UINT width = 0;
+  UINT height = 0;
+  hr = source_frame.get()->GetSize(&width, &height);
+  if (FAILED(hr)) {
+    throwWicError("Failed to read depth PNG size", depth_path, hr);
+  }
+
+  Intrinsics intrinsics = intrinsics_hint;
+  intrinsics.width = static_cast<int>(width);
+  intrinsics.height = static_cast<int>(height);
+  return intrinsics;
+}
+
 inline DepthFrame loadDepthPng(const fs::path& path,
                                const Intrinsics& intrinsics,
                                const float depth_scale,
@@ -174,7 +310,7 @@ inline DepthFrame loadDepthPng(const fs::path& path,
 
   if (static_cast<int>(width) != intrinsics.width || static_cast<int>(height) != intrinsics.height) {
     throw std::runtime_error(makeDecodeError(
-        "Depth image resolution does not match intrinsic.txt", path,
+        "Depth image resolution does not match dataset intrinsics metadata", path,
         std::to_string(width) + "x" + std::to_string(height) + " vs " + std::to_string(intrinsics.width) + "x" +
             std::to_string(intrinsics.height)));
   }
@@ -235,7 +371,28 @@ inline DepthFrame loadDepthPng(const fs::path& path,
   throw std::runtime_error("Depth PNG decoding is only implemented for Windows builds via WIC.");
 }
 
+inline Intrinsics completeIntrinsicsResolutionFromDepth(const Intrinsics& intrinsics_hint, const fs::path& depth_path) {
+  static_cast<void>(intrinsics_hint);
+  static_cast<void>(depth_path);
+  throw std::runtime_error("Depth PNG size probing is only implemented for Windows builds via WIC.");
+}
+
 #endif
+
+inline Intrinsics loadDatasetIntrinsics(const fs::path& path, float& depth_scale) {
+  const fs::path metadata_path = findDatasetIntrinsicsMetadataPath(path);
+  const std::vector<double> values = readNumericValuesFromFile(metadata_path);
+  Intrinsics intrinsics;
+  bool has_resolution = false;
+  parseIntrinsicsMetadataValues(values, metadata_path, intrinsics, depth_scale, has_resolution);
+
+  if (!has_resolution) {
+    const fs::path dataset_root = resolveDatasetRootFromMetadataPath(metadata_path);
+    intrinsics = completeIntrinsicsResolutionFromDepth(intrinsics, findFirstDatasetDepthImage(dataset_root));
+  }
+
+  return intrinsics;
+}
 
 inline DatasetFrame loadDatasetDepthFrame(const fs::path& dataset_root,
                                           const int frame_id,
