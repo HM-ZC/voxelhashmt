@@ -332,6 +332,39 @@ class VoxelHashTSDF {
     return depth > 0.0f;
   }
 
+  bool sampleDepthBilinear(const DepthFrame& frame, const float u, const float v, float& depth) const {
+    const int width = frame.intrinsics.width;
+    const int height = frame.intrinsics.height;
+    if (width <= 0 || height <= 0) {
+      return false;
+    }
+
+    if (u < 0.0f || v < 0.0f || u > static_cast<float>(width - 1) || v > static_cast<float>(height - 1)) {
+      return false;
+    }
+
+    const int x0 = static_cast<int>(std::floor(u));
+    const int y0 = static_cast<int>(std::floor(v));
+    const int x1 = std::min(x0 + 1, width - 1);
+    const int y1 = std::min(y0 + 1, height - 1);
+    const float tx = u - static_cast<float>(x0);
+    const float ty = v - static_cast<float>(y0);
+
+    const float d00 = frame.at(x0, y0);
+    const float d10 = frame.at(x1, y0);
+    const float d01 = frame.at(x0, y1);
+    const float d11 = frame.at(x1, y1);
+
+    if (d00 > 0.0f && d10 > 0.0f && d01 > 0.0f && d11 > 0.0f) {
+      const float top = d00 + (d10 - d00) * tx;
+      const float bottom = d01 + (d11 - d01) * tx;
+      depth = top + (bottom - top) * ty;
+      return true;
+    }
+
+    return sampleDepthNearest(frame, u, v, depth);
+  }
+
   const Voxel* findVoxel(const Vec3i& voxel_coord) const {
     const BlockKey key = voxelToBlockKey(voxel_coord);
     const auto it = blocks_.find(key);
@@ -386,7 +419,7 @@ class VoxelHashTSDF {
             }
 
             float depth = 0.0f;
-            if (!sampleDepthNearest(frame, u, v, depth)) {
+            if (!sampleDepthBilinear(frame, u, v, depth)) {
               continue;
             }
 

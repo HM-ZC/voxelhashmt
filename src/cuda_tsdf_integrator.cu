@@ -120,6 +120,39 @@ __device__ bool sampleDepthNearest(const float* depth, const GpuIntrinsics& intr
   return depth_value > 0.0f;
 }
 
+__device__ bool sampleDepthBilinear(const float* depth, const GpuIntrinsics& intrinsics, const float u, const float v,
+                                    float& depth_value) {
+  if (intrinsics.width <= 0 || intrinsics.height <= 0) {
+    return false;
+  }
+
+  if (u < 0.0f || v < 0.0f || u > static_cast<float>(intrinsics.width - 1) ||
+      v > static_cast<float>(intrinsics.height - 1)) {
+    return false;
+  }
+
+  const int x0 = static_cast<int>(floorf(u));
+  const int y0 = static_cast<int>(floorf(v));
+  const int x1 = min(x0 + 1, intrinsics.width - 1);
+  const int y1 = min(y0 + 1, intrinsics.height - 1);
+  const float tx = u - static_cast<float>(x0);
+  const float ty = v - static_cast<float>(y0);
+
+  const float d00 = depth[static_cast<std::size_t>(y0 * intrinsics.width + x0)];
+  const float d10 = depth[static_cast<std::size_t>(y0 * intrinsics.width + x1)];
+  const float d01 = depth[static_cast<std::size_t>(y1 * intrinsics.width + x0)];
+  const float d11 = depth[static_cast<std::size_t>(y1 * intrinsics.width + x1)];
+
+  if (d00 > 0.0f && d10 > 0.0f && d01 > 0.0f && d11 > 0.0f) {
+    const float top = d00 + (d10 - d00) * tx;
+    const float bottom = d01 + (d11 - d01) * tx;
+    depth_value = top + (bottom - top) * ty;
+    return true;
+  }
+
+  return sampleDepthNearest(depth, intrinsics, u, v, depth_value);
+}
+
 __global__ void integrateActiveBlocksKernel(VoxelHashTSDF::FlatBlockRecord* flat_blocks, const float* depth) {
   const unsigned int block_index = blockIdx.x;
   if (block_index >= c_params.num_blocks) {
@@ -153,7 +186,7 @@ __global__ void integrateActiveBlocksKernel(VoxelHashTSDF::FlatBlockRecord* flat
   }
 
   float depth_value = 0.0f;
-  if (!sampleDepthNearest(depth, c_params.intrinsics, u, v, depth_value)) {
+  if (!sampleDepthBilinear(depth, c_params.intrinsics, u, v, depth_value)) {
     return;
   }
 

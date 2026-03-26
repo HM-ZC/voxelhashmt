@@ -35,8 +35,8 @@ struct Options {
   int frames = 28;
   int width = 128;
   int height = 96;
-  float voxel_size = 0.03f;
-  float truncation = 0.09f;
+  float voxel_size = 0.0005f;
+  float truncation = 0.0015f;
   std::string dataset_root = TSDFMC_DEFAULT_DATASET_ROOT;
   int frame_start = 0;
   int frame_end = -1;
@@ -438,7 +438,7 @@ int runSyntheticDemo(const Options& options) {
     render_total += render_elapsed;
 
     const Clock::time_point integrate_start = Clock::now();
-    integration_backend.integrate(volume, frame, T_wc, 2);
+    integration_backend.integrate(volume, frame, T_wc, 1);
     const Milliseconds integrate_elapsed = Clock::now() - integrate_start;
     integrate_total += integrate_elapsed;
     const Milliseconds frame_elapsed = Clock::now() - frame_start;
@@ -550,7 +550,7 @@ int runDatasetReconstruction(const Options& options) {
               << "), valid_depth=" << frame.valid_depth_samples << "/" << total_pixels << '\n';
 
     const Clock::time_point integrate_start = Clock::now();
-    integration_backend.integrate(volume, frame.depth_frame, frame.T_wc, 2);
+    integration_backend.integrate(volume, frame.depth_frame, frame.T_wc, 1);
     const Milliseconds integrate_elapsed = Clock::now() - integrate_start;
     integrate_total += integrate_elapsed;
     const Milliseconds frame_elapsed = Clock::now() - frame_start;
