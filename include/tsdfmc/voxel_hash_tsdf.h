@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -79,7 +80,7 @@ class VoxelHashTSDF {
         const float signed_distance = range - sample_range;
         const float tsdf = clampf(signed_distance / truncation_distance_, -1.0f, 1.0f);
         const Vec3f sample_w = camera_origin_w + ray_w * sample_range;
-        updateVoxelAtWorld(sample_w, tsdf);
+        updateVoxelAtWorld(sample_w, tsdf, range, signed_distance);
       }
     }
   }
@@ -209,9 +210,10 @@ class VoxelHashTSDF {
   }
 
  private:
-  float voxel_size_ = 0.02f;
+ float voxel_size_ = 0.02f;
   float truncation_distance_ = 0.06f;
   std::unordered_map<BlockKey, Block, BlockKeyHash> blocks_;
+  static constexpr float kMaxVoxelWeight = 100.0f;
 
   static bool blockHasObservedVoxels(const Block& block) {
     for (const Voxel& voxel : block.voxels) {
@@ -241,6 +243,33 @@ class VoxelHashTSDF {
 
   static int localIndexFromCoords(const int lx, const int ly, const int lz) {
     return lx + kBlockSize * (ly + kBlockSize * lz);
+  }
+
+  static float computeObservationWeight(const float depth,
+                                        const float signed_distance,
+                                        const float truncation_distance) {
+    if (depth <= 0.0f || truncation_distance <= 1e-6f) {
+      return 0.0f;
+    }
+
+    // Depth uncertainty grows with range: down-weight farther samples.
+    constexpr float kDepthSigma = 1.5f;
+    const float depth_ratio = depth / kDepthSigma;
+    const float depth_weight = 1.0f / (1.0f + depth_ratio * depth_ratio);
+
+    // Robust kernel against outliers inside the truncation band.
+    const float normalized_residual = std::fabs(signed_distance) / truncation_distance;
+    constexpr float kHuberDelta = 0.35f;
+    float robust_weight = 1.0f;
+    if (normalized_residual > kHuberDelta) {
+      robust_weight = kHuberDelta / normalized_residual;
+    }
+
+    // Favor voxels closer to the zero-crossing surface.
+    const float band_weight = 1.0f - 0.5f * clampf(normalized_residual, 0.0f, 1.0f);
+
+    constexpr float kMinObservationWeight = 0.05f;
+    return std::max(kMinObservationWeight, depth_weight * robust_weight * band_weight);
   }
 
   Vec3i worldToVoxel(const Vec3f& point) const {
@@ -376,15 +405,23 @@ class VoxelHashTSDF {
     return &it->second.voxels[static_cast<std::size_t>(index)];
   }
 
-  void updateVoxelAtWorld(const Vec3f& point_w, const float tsdf) {
+  void updateVoxelAtWorld(const Vec3f& point_w,
+                          const float tsdf,
+                          const float measurement_depth,
+                          const float signed_distance) {
     const Vec3i voxel_coord = worldToVoxel(point_w);
     const BlockKey key = voxelToBlockKey(voxel_coord);
     Block& block = blocks_[key];
     const int index = voxelToLocalIndex(voxel_coord);
     Voxel& voxel = block.voxels[static_cast<std::size_t>(index)];
 
-    constexpr float observation_weight = 1.0f;
-    const float new_weight = std::min(100.0f, voxel.weight + observation_weight);
+    const float observation_weight =
+        computeObservationWeight(measurement_depth, signed_distance, truncation_distance_);
+    if (observation_weight <= 0.0f) {
+      return;
+    }
+
+    const float new_weight = std::min(kMaxVoxelWeight, voxel.weight + observation_weight);
     voxel.tsdf = (voxel.tsdf * voxel.weight + tsdf * observation_weight) / new_weight;
     voxel.weight = new_weight;
   }
@@ -431,9 +468,12 @@ class VoxelHashTSDF {
             const float tsdf = clampf(signed_distance / truncation_distance_, -1.0f, 1.0f);
             const int index = localIndexFromCoords(lx, ly, lz);
             Voxel& voxel = block.voxels[static_cast<std::size_t>(index)];
+            const float observation_weight = computeObservationWeight(depth, signed_distance, truncation_distance_);
+            if (observation_weight <= 0.0f) {
+              continue;
+            }
 
-            constexpr float observation_weight = 1.0f;
-            const float new_weight = std::min(100.0f, voxel.weight + observation_weight);
+            const float new_weight = std::min(kMaxVoxelWeight, voxel.weight + observation_weight);
             voxel.tsdf = (voxel.tsdf * voxel.weight + tsdf * observation_weight) / new_weight;
             voxel.weight = new_weight;
           }

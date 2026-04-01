@@ -15,6 +15,9 @@ namespace {
 constexpr int kCudaBlockSize = 8;
 constexpr int kCudaBlockVolume = kCudaBlockSize * kCudaBlockSize * kCudaBlockSize;
 constexpr float kMaxVoxelWeight = 100.0f;
+constexpr float kDepthSigma = 1.5f;
+constexpr float kHuberDelta = 0.35f;
+constexpr float kMinObservationWeight = 0.05f;
 
 static_assert(VoxelHashTSDF::kBlockSize == kCudaBlockSize, "CUDA kernel assumes 8x8x8 voxel blocks.");
 static_assert(VoxelHashTSDF::kBlockVolume == kCudaBlockVolume, "CUDA kernel block volume mismatch.");
@@ -87,6 +90,26 @@ IntegratorWorkspace& integratorWorkspace() {
 
 __device__ float clampGpu(const float value, const float min_value, const float max_value) {
   return fminf(max_value, fmaxf(min_value, value));
+}
+
+__device__ float computeObservationWeightGpu(const float depth,
+                                             const float signed_distance,
+                                             const float truncation_distance) {
+  if (depth <= 0.0f || truncation_distance <= 1e-6f) {
+    return 0.0f;
+  }
+
+  const float depth_ratio = depth / kDepthSigma;
+  const float depth_weight = 1.0f / (1.0f + depth_ratio * depth_ratio);
+
+  const float normalized_residual = fabsf(signed_distance) / truncation_distance;
+  float robust_weight = 1.0f;
+  if (normalized_residual > kHuberDelta) {
+    robust_weight = kHuberDelta / normalized_residual;
+  }
+
+  const float band_weight = 1.0f - 0.5f * clampGpu(normalized_residual, 0.0f, 1.0f);
+  return fmaxf(kMinObservationWeight, depth_weight * robust_weight * band_weight);
 }
 
 __device__ GpuVec3f transformPoint(const GpuPose& pose, const GpuVec3f& p) {
@@ -196,9 +219,15 @@ __global__ void integrateActiveBlocksKernel(VoxelHashTSDF::FlatBlockRecord* flat
   }
 
   const float tsdf = clampGpu(signed_distance / c_params.truncation_distance, -1.0f, 1.0f);
+  const float observation_weight =
+      computeObservationWeightGpu(depth_value, signed_distance, c_params.truncation_distance);
+  if (observation_weight <= 0.0f) {
+    return;
+  }
+
   Voxel& voxel = flat_block.voxels[local_index];
-  const float new_weight = fminf(kMaxVoxelWeight, voxel.weight + 1.0f);
-  voxel.tsdf = (voxel.tsdf * voxel.weight + tsdf) / new_weight;
+  const float new_weight = fminf(kMaxVoxelWeight, voxel.weight + observation_weight);
+  voxel.tsdf = (voxel.tsdf * voxel.weight + tsdf * observation_weight) / new_weight;
   voxel.weight = new_weight;
 }
 

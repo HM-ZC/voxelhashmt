@@ -35,8 +35,8 @@ struct Options {
   int frames = 28;
   int width = 128;
   int height = 96;
-  float voxel_size = 0.0005f;
-  float truncation = 0.0015f;
+  float voxel_size = 0.0003f;
+  float truncation = 0.0009f;
   std::string dataset_root = TSDFMC_DEFAULT_DATASET_ROOT;
   int frame_start = 0;
   int frame_end = -1;
