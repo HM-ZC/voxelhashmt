@@ -18,6 +18,7 @@ constexpr float kMaxVoxelWeight = 100.0f;
 constexpr float kDepthSigma = 1.5f;
 constexpr float kHuberDelta = 0.35f;
 constexpr float kMinObservationWeight = 0.05f;
+constexpr float kMinViewAngleWeight = 0.15f;
 
 static_assert(VoxelHashTSDF::kBlockSize == kCudaBlockSize, "CUDA kernel assumes 8x8x8 voxel blocks.");
 static_assert(VoxelHashTSDF::kBlockVolume == kCudaBlockVolume, "CUDA kernel block volume mismatch.");
@@ -92,9 +93,40 @@ __device__ float clampGpu(const float value, const float min_value, const float 
   return fminf(max_value, fmaxf(min_value, value));
 }
 
+__device__ GpuVec3f subVec(const GpuVec3f& a, const GpuVec3f& b) {
+  return {a.x - b.x, a.y - b.y, a.z - b.z};
+}
+
+__device__ float dotVec(const GpuVec3f& a, const GpuVec3f& b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+__device__ GpuVec3f crossVec(const GpuVec3f& a, const GpuVec3f& b) {
+  return {
+      a.y * b.z - a.z * b.y,
+      a.z * b.x - a.x * b.z,
+      a.x * b.y - a.y * b.x,
+  };
+}
+
+__device__ float normVec(const GpuVec3f& v) {
+  return sqrtf(dotVec(v, v));
+}
+
+__device__ GpuVec3f normalizeVec(const GpuVec3f& v) {
+  const float length = normVec(v);
+  if (length <= 1e-6f) {
+    return {0.0f, 0.0f, 0.0f};
+  }
+
+  const float inv = 1.0f / length;
+  return {v.x * inv, v.y * inv, v.z * inv};
+}
+
 __device__ float computeObservationWeightGpu(const float depth,
                                              const float signed_distance,
-                                             const float truncation_distance) {
+                                             const float truncation_distance,
+                                             const float view_angle_weight = 1.0f) {
   if (depth <= 0.0f || truncation_distance <= 1e-6f) {
     return 0.0f;
   }
@@ -109,7 +141,9 @@ __device__ float computeObservationWeightGpu(const float depth,
   }
 
   const float band_weight = 1.0f - 0.5f * clampGpu(normalized_residual, 0.0f, 1.0f);
-  return fmaxf(kMinObservationWeight, depth_weight * robust_weight * band_weight);
+  const float base_weight = fmaxf(kMinObservationWeight, depth_weight * robust_weight * band_weight);
+  const float angle_weight = clampGpu(view_angle_weight, kMinViewAngleWeight, 1.0f);
+  return base_weight * angle_weight;
 }
 
 __device__ GpuVec3f transformPoint(const GpuPose& pose, const GpuVec3f& p) {
@@ -176,6 +210,44 @@ __device__ bool sampleDepthBilinear(const float* depth, const GpuIntrinsics& int
   return sampleDepthNearest(depth, intrinsics, u, v, depth_value);
 }
 
+__device__ GpuVec3f backProjectContinuous(const float u,
+                                          const float v,
+                                          const float depth,
+                                          const GpuIntrinsics& intrinsics) {
+  return {
+      (u - intrinsics.cx) * depth / intrinsics.fx,
+      (v - intrinsics.cy) * depth / intrinsics.fy,
+      depth,
+  };
+}
+
+__device__ bool estimateSurfaceNormalCamera(const float* depth,
+                                            const GpuIntrinsics& intrinsics,
+                                            const float u,
+                                            const float v,
+                                            GpuVec3f& normal) {
+  float depth_left = 0.0f;
+  float depth_right = 0.0f;
+  float depth_up = 0.0f;
+  float depth_down = 0.0f;
+  if (!sampleDepthBilinear(depth, intrinsics, u - 1.0f, v, depth_left) ||
+      !sampleDepthBilinear(depth, intrinsics, u + 1.0f, v, depth_right) ||
+      !sampleDepthBilinear(depth, intrinsics, u, v - 1.0f, depth_up) ||
+      !sampleDepthBilinear(depth, intrinsics, u, v + 1.0f, depth_down)) {
+    return false;
+  }
+
+  const GpuVec3f p_left = backProjectContinuous(u - 1.0f, v, depth_left, intrinsics);
+  const GpuVec3f p_right = backProjectContinuous(u + 1.0f, v, depth_right, intrinsics);
+  const GpuVec3f p_up = backProjectContinuous(u, v - 1.0f, depth_up, intrinsics);
+  const GpuVec3f p_down = backProjectContinuous(u, v + 1.0f, depth_down, intrinsics);
+
+  const GpuVec3f dx = subVec(p_right, p_left);
+  const GpuVec3f dy = subVec(p_down, p_up);
+  normal = normalizeVec(crossVec(dy, dx));
+  return normVec(normal) > 1e-6f;
+}
+
 __global__ void integrateActiveBlocksKernel(VoxelHashTSDF::FlatBlockRecord* flat_blocks, const float* depth) {
   const unsigned int block_index = blockIdx.x;
   if (block_index >= c_params.num_blocks) {
@@ -219,8 +291,15 @@ __global__ void integrateActiveBlocksKernel(VoxelHashTSDF::FlatBlockRecord* flat
   }
 
   const float tsdf = clampGpu(signed_distance / c_params.truncation_distance, -1.0f, 1.0f);
+  float view_angle_weight = 1.0f;
+  GpuVec3f normal_c{};
+  if (estimateSurfaceNormalCamera(depth, c_params.intrinsics, u, v, normal_c)) {
+    const GpuVec3f view_ray_c = normalizeVec(point_c);
+    view_angle_weight = fabsf(dotVec(normal_c, view_ray_c));
+  }
+
   const float observation_weight =
-      computeObservationWeightGpu(depth_value, signed_distance, c_params.truncation_distance);
+      computeObservationWeightGpu(depth_value, signed_distance, c_params.truncation_distance, view_angle_weight);
   if (observation_weight <= 0.0f) {
     return;
   }

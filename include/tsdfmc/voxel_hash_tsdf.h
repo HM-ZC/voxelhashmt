@@ -210,10 +210,11 @@ class VoxelHashTSDF {
   }
 
  private:
- float voxel_size_ = 0.02f;
+  float voxel_size_ = 0.02f;
   float truncation_distance_ = 0.06f;
   std::unordered_map<BlockKey, Block, BlockKeyHash> blocks_;
   static constexpr float kMaxVoxelWeight = 100.0f;
+  static constexpr float kMinViewAngleWeight = 0.15f;
 
   static bool blockHasObservedVoxels(const Block& block) {
     for (const Voxel& voxel : block.voxels) {
@@ -247,7 +248,8 @@ class VoxelHashTSDF {
 
   static float computeObservationWeight(const float depth,
                                         const float signed_distance,
-                                        const float truncation_distance) {
+                                        const float truncation_distance,
+                                        const float view_angle_weight = 1.0f) {
     if (depth <= 0.0f || truncation_distance <= 1e-6f) {
       return 0.0f;
     }
@@ -269,7 +271,18 @@ class VoxelHashTSDF {
     const float band_weight = 1.0f - 0.5f * clampf(normalized_residual, 0.0f, 1.0f);
 
     constexpr float kMinObservationWeight = 0.05f;
-    return std::max(kMinObservationWeight, depth_weight * robust_weight * band_weight);
+    const float base_weight = std::max(kMinObservationWeight, depth_weight * robust_weight * band_weight);
+    const float angle_weight = clampf(view_angle_weight, kMinViewAngleWeight, 1.0f);
+    return base_weight * angle_weight;
+  }
+
+  static Vec3f backProjectContinuous(const float u,
+                                     const float v,
+                                     const float depth,
+                                     const Intrinsics& K) {
+    const float x = (u - K.cx) * depth / K.fx;
+    const float y = (v - K.cy) * depth / K.fy;
+    return {x, y, depth};
   }
 
   Vec3i worldToVoxel(const Vec3f& point) const {
@@ -394,6 +407,29 @@ class VoxelHashTSDF {
     return sampleDepthNearest(frame, u, v, depth);
   }
 
+  bool estimateSurfaceNormalCamera(const DepthFrame& frame, const float u, const float v, Vec3f& normal) const {
+    float depth_left = 0.0f;
+    float depth_right = 0.0f;
+    float depth_up = 0.0f;
+    float depth_down = 0.0f;
+    if (!sampleDepthBilinear(frame, u - 1.0f, v, depth_left) ||
+        !sampleDepthBilinear(frame, u + 1.0f, v, depth_right) ||
+        !sampleDepthBilinear(frame, u, v - 1.0f, depth_up) ||
+        !sampleDepthBilinear(frame, u, v + 1.0f, depth_down)) {
+      return false;
+    }
+
+    const Vec3f p_left = backProjectContinuous(u - 1.0f, v, depth_left, frame.intrinsics);
+    const Vec3f p_right = backProjectContinuous(u + 1.0f, v, depth_right, frame.intrinsics);
+    const Vec3f p_up = backProjectContinuous(u, v - 1.0f, depth_up, frame.intrinsics);
+    const Vec3f p_down = backProjectContinuous(u, v + 1.0f, depth_down, frame.intrinsics);
+
+    const Vec3f dx = p_right - p_left;
+    const Vec3f dy = p_down - p_up;
+    normal = normalized(cross(dy, dx));
+    return norm(normal) > 1e-6f;
+  }
+
   const Voxel* findVoxel(const Vec3i& voxel_coord) const {
     const BlockKey key = voxelToBlockKey(voxel_coord);
     const auto it = blocks_.find(key);
@@ -468,7 +504,15 @@ class VoxelHashTSDF {
             const float tsdf = clampf(signed_distance / truncation_distance_, -1.0f, 1.0f);
             const int index = localIndexFromCoords(lx, ly, lz);
             Voxel& voxel = block.voxels[static_cast<std::size_t>(index)];
-            const float observation_weight = computeObservationWeight(depth, signed_distance, truncation_distance_);
+            float view_angle_weight = 1.0f;
+            Vec3f surface_normal_c{};
+            if (estimateSurfaceNormalCamera(frame, u, v, surface_normal_c)) {
+              const Vec3f view_ray_c = normalized(point_c);
+              view_angle_weight = std::fabs(dot(surface_normal_c, view_ray_c));
+            }
+
+            const float observation_weight =
+                computeObservationWeight(depth, signed_distance, truncation_distance_, view_angle_weight);
             if (observation_weight <= 0.0f) {
               continue;
             }
