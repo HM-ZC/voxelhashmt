@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "tsdfmc/math_types.h"
+#include "tsdfmc/marching_cubes_tables.h"
 
 namespace tsdfmc {
 
@@ -44,125 +45,51 @@ inline Vec3f interpolateVertex(const Vec3f& p0,
   return p0 + (p1 - p0) * t;
 }
 
-inline void polygoniseTetra(const std::array<Vec3f, 8>& positions,
-                            const std::array<float, 8>& values,
-                            const std::array<int, 4>& tetra,
-                            const float iso_level,
-                            std::vector<Triangle>& triangles) {
-  std::array<int, 4> inside_vertices{};
-  std::array<int, 4> outside_vertices{};
-  int inside_count = 0;
-  int outside_count = 0;
-
-  for (int i = 0; i < 4; ++i) {
-    const int vi = tetra[static_cast<std::size_t>(i)];
-    if (values[static_cast<std::size_t>(vi)] < iso_level) {
-      inside_vertices[static_cast<std::size_t>(inside_count++)] = vi;
-    } else {
-      outside_vertices[static_cast<std::size_t>(outside_count++)] = vi;
-    }
-  }
-
-  if (inside_count == 0 || inside_count == 4) {
-    return;
-  }
-
-  if (inside_count == 1) {
-    const int a = inside_vertices[0];
-    const int b = outside_vertices[0];
-    const int c = outside_vertices[1];
-    const int d = outside_vertices[2];
-
-    const Vec3f p0 = interpolateVertex(positions[static_cast<std::size_t>(a)],
-                                       positions[static_cast<std::size_t>(b)],
-                                       values[static_cast<std::size_t>(a)],
-                                       values[static_cast<std::size_t>(b)],
-                                       iso_level);
-    const Vec3f p1 = interpolateVertex(positions[static_cast<std::size_t>(a)],
-                                       positions[static_cast<std::size_t>(c)],
-                                       values[static_cast<std::size_t>(a)],
-                                       values[static_cast<std::size_t>(c)],
-                                       iso_level);
-    const Vec3f p2 = interpolateVertex(positions[static_cast<std::size_t>(a)],
-                                       positions[static_cast<std::size_t>(d)],
-                                       values[static_cast<std::size_t>(a)],
-                                       values[static_cast<std::size_t>(d)],
-                                       iso_level);
-    triangles.push_back({p0, p1, p2});
-    return;
-  }
-
-  if (inside_count == 3) {
-    const int a = outside_vertices[0];
-    const int b = inside_vertices[0];
-    const int c = inside_vertices[1];
-    const int d = inside_vertices[2];
-
-    const Vec3f p0 = interpolateVertex(positions[static_cast<std::size_t>(a)],
-                                       positions[static_cast<std::size_t>(b)],
-                                       values[static_cast<std::size_t>(a)],
-                                       values[static_cast<std::size_t>(b)],
-                                       iso_level);
-    const Vec3f p1 = interpolateVertex(positions[static_cast<std::size_t>(a)],
-                                       positions[static_cast<std::size_t>(d)],
-                                       values[static_cast<std::size_t>(a)],
-                                       values[static_cast<std::size_t>(d)],
-                                       iso_level);
-    const Vec3f p2 = interpolateVertex(positions[static_cast<std::size_t>(a)],
-                                       positions[static_cast<std::size_t>(c)],
-                                       values[static_cast<std::size_t>(a)],
-                                       values[static_cast<std::size_t>(c)],
-                                       iso_level);
-    triangles.push_back({p0, p1, p2});
-    return;
-  }
-
-  // inside_count == 2: produce a quad split into two triangles.
-  const int a = inside_vertices[0];
-  const int b = inside_vertices[1];
-  const int c = outside_vertices[0];
-  const int d = outside_vertices[1];
-
-  const Vec3f p0 = interpolateVertex(positions[static_cast<std::size_t>(a)],
-                                     positions[static_cast<std::size_t>(c)],
-                                     values[static_cast<std::size_t>(a)],
-                                     values[static_cast<std::size_t>(c)],
-                                     iso_level);
-  const Vec3f p1 = interpolateVertex(positions[static_cast<std::size_t>(a)],
-                                     positions[static_cast<std::size_t>(d)],
-                                     values[static_cast<std::size_t>(a)],
-                                     values[static_cast<std::size_t>(d)],
-                                     iso_level);
-  const Vec3f p2 = interpolateVertex(positions[static_cast<std::size_t>(b)],
-                                     positions[static_cast<std::size_t>(c)],
-                                     values[static_cast<std::size_t>(b)],
-                                     values[static_cast<std::size_t>(c)],
-                                     iso_level);
-  const Vec3f p3 = interpolateVertex(positions[static_cast<std::size_t>(b)],
-                                     positions[static_cast<std::size_t>(d)],
-                                     values[static_cast<std::size_t>(b)],
-                                     values[static_cast<std::size_t>(d)],
-                                     iso_level);
-
-  triangles.push_back({p0, p1, p2});
-  triangles.push_back({p1, p3, p2});
-}
-
 inline void polygoniseCube(const std::array<Vec3f, 8>& positions,
                            const std::array<float, 8>& values,
                            const float iso_level,
                            std::vector<Triangle>& triangles) {
-  static constexpr std::array<std::array<int, 4>, 6> kCubeTetrahedra = {{
-      {{0, 5, 1, 6}},
-      {{0, 1, 2, 6}},
-      {{0, 2, 3, 6}},
-      {{0, 3, 7, 6}},
-      {{0, 7, 4, 6}},
-      {{0, 4, 5, 6}},
-  }};
+  int cube_index = 0;
+  for (int corner = 0; corner < 8; ++corner) {
+    if (values[static_cast<std::size_t>(corner)] < iso_level) {
+      cube_index |= (1 << corner);
+    }
+  }
 
-  for (const auto& tetra : kCubeTetrahedra) {
-    polygoniseTetra(positions, values, tetra, iso_level, triangles);
+  const int edge_mask = kMarchingCubesEdgeTable[static_cast<std::size_t>(cube_index)];
+  if (edge_mask == 0) {
+    return;
+  }
+
+  std::array<Vec3f, 12> edge_vertices{};
+  for (int edge = 0; edge < 12; ++edge) {
+    if ((edge_mask & (1 << edge)) == 0) {
+      continue;
+    }
+
+    const int c0 = kEdgeCorners[edge][0];
+    const int c1 = kEdgeCorners[edge][1];
+    edge_vertices[static_cast<std::size_t>(edge)] = interpolateVertex(
+        positions[static_cast<std::size_t>(c0)],
+        positions[static_cast<std::size_t>(c1)],
+        values[static_cast<std::size_t>(c0)],
+        values[static_cast<std::size_t>(c1)],
+        iso_level);
+  }
+
+  const std::array<int, 16>& tri_row = kMarchingCubesTriTable[static_cast<std::size_t>(cube_index)];
+  for (int i = 0; i < 16; i += 3) {
+    const int e0 = tri_row[static_cast<std::size_t>(i)];
+    if (e0 < 0) {
+      break;
+    }
+    const int e1 = tri_row[static_cast<std::size_t>(i + 1)];
+    const int e2 = tri_row[static_cast<std::size_t>(i + 2)];
+    triangles.push_back({
+        edge_vertices[static_cast<std::size_t>(e0)],
+        edge_vertices[static_cast<std::size_t>(e1)],
+        edge_vertices[static_cast<std::size_t>(e2)],
+    });
   }
 }
 

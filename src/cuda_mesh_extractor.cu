@@ -12,7 +12,7 @@ namespace {
 
 constexpr int kCudaBlockSize = 8;
 constexpr int kCudaBlockVolume = kCudaBlockSize * kCudaBlockSize * kCudaBlockSize;
-constexpr int kMaxTrianglesPerCube = 12;
+constexpr int kMaxTrianglesPerCube = 5;
 constexpr int kEmptyLookupIndex = -1;
 
 static_assert(VoxelHashTSDF::kBlockSize == kCudaBlockSize, "CUDA mesh extractor assumes 8x8x8 voxel blocks.");
@@ -43,25 +43,55 @@ __device__ __constant__ int c_corner_offsets[8][3] = {
     {0, 1, 1},
 };
 
-__device__ __constant__ int c_cube_tetrahedra[6][4] = {
-    {0, 5, 1, 6},
-    {0, 1, 2, 6},
-    {0, 2, 3, 6},
-    {0, 3, 7, 6},
-    {0, 7, 4, 6},
-    {0, 4, 5, 6},
+__device__ __constant__ int c_edge_corners[12][2] = {
+    {0, 1},
+    {1, 2},
+    {2, 3},
+    {3, 0},
+    {4, 5},
+    {5, 6},
+    {6, 7},
+    {7, 4},
+    {0, 4},
+    {1, 5},
+    {2, 6},
+    {3, 7},
 };
+
+__device__ __constant__ int c_mc_edge_table[256];
+__device__ __constant__ int c_mc_tri_table[256 * 16];
 
 struct MeshExtractorWorkspace {
   ReusableDeviceBuffer<VoxelHashTSDF::FlatBlockRecord> flat_blocks;
   ReusableDeviceBuffer<MeshLookupEntry> lookup_table;
   ReusableDeviceBuffer<unsigned int> triangle_count;
   ReusableDeviceBuffer<Triangle> triangles;
+  bool lookup_tables_initialized = false;
 };
 
 MeshExtractorWorkspace& meshExtractorWorkspace() {
   static MeshExtractorWorkspace workspace;
   return workspace;
+}
+
+void ensureDeviceLookupTablesInitialized(MeshExtractorWorkspace& workspace) {
+  if (workspace.lookup_tables_initialized) {
+    return;
+  }
+
+  throwCudaError(
+      cudaMemcpyToSymbol(
+          c_mc_edge_table,
+          kMarchingCubesEdgeTable.data(),
+          kMarchingCubesEdgeTable.size() * sizeof(int)),
+      "cudaMemcpyToSymbol(c_mc_edge_table)");
+  throwCudaError(
+      cudaMemcpyToSymbol(
+          c_mc_tri_table,
+          kMarchingCubesTriTable.data(),
+          kMarchingCubesTriTable.size() * sizeof(kMarchingCubesTriTable[0])),
+      "cudaMemcpyToSymbol(c_mc_tri_table)");
+  workspace.lookup_tables_initialized = true;
 }
 
 unsigned int hashBlockKeyHost(const BlockKey& key, const unsigned int table_size) {
@@ -197,103 +227,65 @@ __device__ Vec3f interpolateVertexGpu(const Vec3f& p0,
   };
 }
 
-__device__ int countTetraTriangles(const float values[8], const int tetra[4], const float iso_level) {
-  int inside_count = 0;
-  for (int i = 0; i < 4; ++i) {
-    inside_count += values[tetra[i]] < iso_level ? 1 : 0;
+__device__ int computeCubeIndex(const float values[8], const float iso_level) {
+  int cube_index = 0;
+  for (int corner = 0; corner < 8; ++corner) {
+    if (values[corner] < iso_level) {
+      cube_index |= (1 << corner);
+    }
   }
-
-  if (inside_count == 0 || inside_count == 4) {
-    return 0;
-  }
-  if (inside_count == 2) {
-    return 2;
-  }
-  return 1;
+  return cube_index;
 }
 
 __device__ int countCubeTriangles(const float values[8], const float iso_level) {
-  int triangle_count = 0;
-  for (int tetra_index = 0; tetra_index < 6; ++tetra_index) {
-    triangle_count += countTetraTriangles(values, c_cube_tetrahedra[tetra_index], iso_level);
-  }
-  return triangle_count;
-}
-
-__device__ int emitTetraTriangles(const Vec3f positions[8],
-                                  const float values[8],
-                                  const int tetra[4],
-                                  const float iso_level,
-                                  Triangle* out_triangles) {
-  int inside_vertices[4];
-  int outside_vertices[4];
-  int inside_count = 0;
-  int outside_count = 0;
-
-  for (int i = 0; i < 4; ++i) {
-    const int vertex_index = tetra[i];
-    if (values[vertex_index] < iso_level) {
-      inside_vertices[inside_count++] = vertex_index;
-    } else {
-      outside_vertices[outside_count++] = vertex_index;
-    }
-  }
-
-  if (inside_count == 0 || inside_count == 4) {
+  const int cube_index = computeCubeIndex(values, iso_level);
+  const int edge_mask = c_mc_edge_table[cube_index];
+  if (edge_mask == 0) {
     return 0;
   }
 
-  if (inside_count == 1) {
-    const int a = inside_vertices[0];
-    const int b = outside_vertices[0];
-    const int c = outside_vertices[1];
-    const int d = outside_vertices[2];
-
-    out_triangles[0] = {
-        interpolateVertexGpu(positions[a], positions[b], values[a], values[b], iso_level),
-        interpolateVertexGpu(positions[a], positions[c], values[a], values[c], iso_level),
-        interpolateVertexGpu(positions[a], positions[d], values[a], values[d], iso_level),
-    };
-    return 1;
+  const int tri_offset = cube_index * 16;
+  int triangle_count = 0;
+  for (int i = 0; i < 16; i += 3) {
+    if (c_mc_tri_table[tri_offset + i] < 0) {
+      break;
+    }
+    ++triangle_count;
   }
-
-  if (inside_count == 3) {
-    const int a = outside_vertices[0];
-    const int b = inside_vertices[0];
-    const int c = inside_vertices[1];
-    const int d = inside_vertices[2];
-
-    out_triangles[0] = {
-        interpolateVertexGpu(positions[a], positions[b], values[a], values[b], iso_level),
-        interpolateVertexGpu(positions[a], positions[d], values[a], values[d], iso_level),
-        interpolateVertexGpu(positions[a], positions[c], values[a], values[c], iso_level),
-    };
-    return 1;
-  }
-
-  const int a = inside_vertices[0];
-  const int b = inside_vertices[1];
-  const int c = outside_vertices[0];
-  const int d = outside_vertices[1];
-
-  const Vec3f p0 = interpolateVertexGpu(positions[a], positions[c], values[a], values[c], iso_level);
-  const Vec3f p1 = interpolateVertexGpu(positions[a], positions[d], values[a], values[d], iso_level);
-  const Vec3f p2 = interpolateVertexGpu(positions[b], positions[c], values[b], values[c], iso_level);
-  const Vec3f p3 = interpolateVertexGpu(positions[b], positions[d], values[b], values[d], iso_level);
-
-  out_triangles[0] = {p0, p1, p2};
-  out_triangles[1] = {p1, p3, p2};
-  return 2;
+  return triangle_count;
 }
 
 __device__ int emitCubeTriangles(const Vec3f positions[8],
                                  const float values[8],
                                  const float iso_level,
                                  Triangle* out_triangles) {
+  const int cube_index = computeCubeIndex(values, iso_level);
+  const int edge_mask = c_mc_edge_table[cube_index];
+  if (edge_mask == 0) {
+    return 0;
+  }
+
+  Vec3f edge_vertices[12];
+  for (int edge = 0; edge < 12; ++edge) {
+    if ((edge_mask & (1 << edge)) == 0) {
+      continue;
+    }
+
+    const int c0 = c_edge_corners[edge][0];
+    const int c1 = c_edge_corners[edge][1];
+    edge_vertices[edge] = interpolateVertexGpu(positions[c0], positions[c1], values[c0], values[c1], iso_level);
+  }
+
+  const int tri_offset = cube_index * 16;
   int emitted = 0;
-  for (int tetra_index = 0; tetra_index < 6; ++tetra_index) {
-    emitted += emitTetraTriangles(
-        positions, values, c_cube_tetrahedra[tetra_index], iso_level, out_triangles + emitted);
+  for (int i = 0; i < 16; i += 3) {
+    const int e0 = c_mc_tri_table[tri_offset + i];
+    if (e0 < 0) {
+      break;
+    }
+    const int e1 = c_mc_tri_table[tri_offset + i + 1];
+    const int e2 = c_mc_tri_table[tri_offset + i + 2];
+    out_triangles[emitted++] = {edge_vertices[e0], edge_vertices[e1], edge_vertices[e2]};
   }
   return emitted;
 }
@@ -402,6 +394,7 @@ std::vector<Triangle> extractMeshCuda(const VoxelHashTSDF& volume, const float i
 
   const std::vector<MeshLookupEntry> lookup_table = buildLookupTable(flat_blocks);
   MeshExtractorWorkspace& workspace = meshExtractorWorkspace();
+  ensureDeviceLookupTablesInitialized(workspace);
 
   workspace.flat_blocks.copyFromHost(flat_blocks.data(), flat_blocks.size());
   workspace.lookup_table.copyFromHost(lookup_table.data(), lookup_table.size());
