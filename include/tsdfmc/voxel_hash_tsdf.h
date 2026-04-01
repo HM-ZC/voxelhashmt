@@ -215,6 +215,10 @@ class VoxelHashTSDF {
   std::unordered_map<BlockKey, Block, BlockKeyHash> blocks_;
   static constexpr float kMaxVoxelWeight = 100.0f;
   static constexpr float kMinViewAngleWeight = 0.15f;
+  static constexpr int kNormalBilateralRadius = 1;
+  static constexpr float kNormalBilateralSigmaSpatial = 1.0f;
+  static constexpr float kNormalBilateralSigmaRange = 0.0012f;
+  static constexpr float kNormalBilateralSigmaAngular = 0.35f;
 
   static bool blockHasObservedVoxels(const Block& block) {
     for (const Voxel& voxel : block.voxels) {
@@ -244,6 +248,10 @@ class VoxelHashTSDF {
 
   static int localIndexFromCoords(const int lx, const int ly, const int lz) {
     return lx + kBlockSize * (ly + kBlockSize * lz);
+  }
+
+  static float gaussianWeight(const float squared_value, const float inv_two_sigma_sq) {
+    return std::exp(-squared_value * inv_two_sigma_sq);
   }
 
   static float computeObservationWeight(const float depth,
@@ -407,7 +415,7 @@ class VoxelHashTSDF {
     return sampleDepthNearest(frame, u, v, depth);
   }
 
-  bool estimateSurfaceNormalCamera(const DepthFrame& frame, const float u, const float v, Vec3f& normal) const {
+  bool estimateSurfaceNormalBaseCamera(const DepthFrame& frame, const float u, const float v, Vec3f& normal) const {
     float depth_left = 0.0f;
     float depth_right = 0.0f;
     float depth_up = 0.0f;
@@ -427,6 +435,70 @@ class VoxelHashTSDF {
     const Vec3f dx = p_right - p_left;
     const Vec3f dy = p_down - p_up;
     normal = normalized(cross(dy, dx));
+    return norm(normal) > 1e-6f;
+  }
+
+  bool estimateSurfaceNormalCamera(const DepthFrame& frame, const float u, const float v, Vec3f& normal) const {
+    Vec3f center_normal{};
+    if (!estimateSurfaceNormalBaseCamera(frame, u, v, center_normal)) {
+      return false;
+    }
+
+    float center_depth = 0.0f;
+    if (!sampleDepthBilinear(frame, u, v, center_depth)) {
+      return false;
+    }
+
+    constexpr float kEpsilon = 1e-6f;
+    constexpr float kInvTwoSpatialSigmaSq =
+        1.0f / (2.0f * kNormalBilateralSigmaSpatial * kNormalBilateralSigmaSpatial);
+    constexpr float kInvTwoRangeSigmaSq =
+        1.0f / (2.0f * kNormalBilateralSigmaRange * kNormalBilateralSigmaRange);
+    constexpr float kInvTwoAngularSigmaSq =
+        1.0f / (2.0f * kNormalBilateralSigmaAngular * kNormalBilateralSigmaAngular);
+
+    Vec3f weighted_normal_sum{};
+    float weight_sum = 0.0f;
+    for (int dv = -kNormalBilateralRadius; dv <= kNormalBilateralRadius; ++dv) {
+      for (int du = -kNormalBilateralRadius; du <= kNormalBilateralRadius; ++du) {
+        const float sample_u = u + static_cast<float>(du);
+        const float sample_v = v + static_cast<float>(dv);
+
+        Vec3f sample_normal{};
+        if (!estimateSurfaceNormalBaseCamera(frame, sample_u, sample_v, sample_normal)) {
+          continue;
+        }
+
+        float sample_depth = 0.0f;
+        if (!sampleDepthBilinear(frame, sample_u, sample_v, sample_depth)) {
+          continue;
+        }
+
+        const float spatial_squared = static_cast<float>(du * du + dv * dv);
+        const float depth_delta = sample_depth - center_depth;
+        const float range_squared = depth_delta * depth_delta;
+        const float cosine = clampf(dot(center_normal, sample_normal), -1.0f, 1.0f);
+        const float angular_delta = 1.0f - cosine;
+        const float angular_squared = angular_delta * angular_delta;
+        const float weight =
+            gaussianWeight(spatial_squared, kInvTwoSpatialSigmaSq) *
+            gaussianWeight(range_squared, kInvTwoRangeSigmaSq) *
+            gaussianWeight(angular_squared, kInvTwoAngularSigmaSq);
+
+        weighted_normal_sum += sample_normal * weight;
+        weight_sum += weight;
+      }
+    }
+
+    if (weight_sum <= kEpsilon) {
+      normal = center_normal;
+      return true;
+    }
+
+    normal = normalized(weighted_normal_sum * (1.0f / weight_sum));
+    if (norm(normal) <= 1e-6f) {
+      normal = center_normal;
+    }
     return norm(normal) > 1e-6f;
   }
 

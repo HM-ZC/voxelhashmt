@@ -19,6 +19,10 @@ constexpr float kDepthSigma = 1.5f;
 constexpr float kHuberDelta = 0.35f;
 constexpr float kMinObservationWeight = 0.05f;
 constexpr float kMinViewAngleWeight = 0.15f;
+constexpr int kNormalBilateralRadius = 1;
+constexpr float kNormalBilateralSigmaSpatial = 1.0f;
+constexpr float kNormalBilateralSigmaRange = 0.0012f;
+constexpr float kNormalBilateralSigmaAngular = 0.35f;
 
 static_assert(VoxelHashTSDF::kBlockSize == kCudaBlockSize, "CUDA kernel assumes 8x8x8 voxel blocks.");
 static_assert(VoxelHashTSDF::kBlockVolume == kCudaBlockVolume, "CUDA kernel block volume mismatch.");
@@ -91,6 +95,10 @@ IntegratorWorkspace& integratorWorkspace() {
 
 __device__ float clampGpu(const float value, const float min_value, const float max_value) {
   return fminf(max_value, fmaxf(min_value, value));
+}
+
+__device__ float gaussianWeightGpu(const float squared_value, const float inv_two_sigma_sq) {
+  return expf(-squared_value * inv_two_sigma_sq);
 }
 
 __device__ GpuVec3f subVec(const GpuVec3f& a, const GpuVec3f& b) {
@@ -221,11 +229,11 @@ __device__ GpuVec3f backProjectContinuous(const float u,
   };
 }
 
-__device__ bool estimateSurfaceNormalCamera(const float* depth,
-                                            const GpuIntrinsics& intrinsics,
-                                            const float u,
-                                            const float v,
-                                            GpuVec3f& normal) {
+__device__ bool estimateSurfaceNormalBaseCamera(const float* depth,
+                                                const GpuIntrinsics& intrinsics,
+                                                const float u,
+                                                const float v,
+                                                GpuVec3f& normal) {
   float depth_left = 0.0f;
   float depth_right = 0.0f;
   float depth_up = 0.0f;
@@ -245,6 +253,81 @@ __device__ bool estimateSurfaceNormalCamera(const float* depth,
   const GpuVec3f dx = subVec(p_right, p_left);
   const GpuVec3f dy = subVec(p_down, p_up);
   normal = normalizeVec(crossVec(dy, dx));
+  return normVec(normal) > 1e-6f;
+}
+
+__device__ bool estimateSurfaceNormalCamera(const float* depth,
+                                            const GpuIntrinsics& intrinsics,
+                                            const float u,
+                                            const float v,
+                                            GpuVec3f& normal) {
+  GpuVec3f center_normal{};
+  if (!estimateSurfaceNormalBaseCamera(depth, intrinsics, u, v, center_normal)) {
+    return false;
+  }
+
+  float center_depth = 0.0f;
+  if (!sampleDepthBilinear(depth, intrinsics, u, v, center_depth)) {
+    return false;
+  }
+
+  constexpr float kEpsilon = 1e-6f;
+  constexpr float kInvTwoSpatialSigmaSq =
+      1.0f / (2.0f * kNormalBilateralSigmaSpatial * kNormalBilateralSigmaSpatial);
+  constexpr float kInvTwoRangeSigmaSq =
+      1.0f / (2.0f * kNormalBilateralSigmaRange * kNormalBilateralSigmaRange);
+  constexpr float kInvTwoAngularSigmaSq =
+      1.0f / (2.0f * kNormalBilateralSigmaAngular * kNormalBilateralSigmaAngular);
+
+  GpuVec3f weighted_normal_sum{0.0f, 0.0f, 0.0f};
+  float weight_sum = 0.0f;
+  for (int dv = -kNormalBilateralRadius; dv <= kNormalBilateralRadius; ++dv) {
+    for (int du = -kNormalBilateralRadius; du <= kNormalBilateralRadius; ++du) {
+      const float sample_u = u + static_cast<float>(du);
+      const float sample_v = v + static_cast<float>(dv);
+
+      GpuVec3f sample_normal{};
+      if (!estimateSurfaceNormalBaseCamera(depth, intrinsics, sample_u, sample_v, sample_normal)) {
+        continue;
+      }
+
+      float sample_depth = 0.0f;
+      if (!sampleDepthBilinear(depth, intrinsics, sample_u, sample_v, sample_depth)) {
+        continue;
+      }
+
+      const float spatial_squared = static_cast<float>(du * du + dv * dv);
+      const float depth_delta = sample_depth - center_depth;
+      const float range_squared = depth_delta * depth_delta;
+      const float cosine = clampGpu(dotVec(center_normal, sample_normal), -1.0f, 1.0f);
+      const float angular_delta = 1.0f - cosine;
+      const float angular_squared = angular_delta * angular_delta;
+      const float weight =
+          gaussianWeightGpu(spatial_squared, kInvTwoSpatialSigmaSq) *
+          gaussianWeightGpu(range_squared, kInvTwoRangeSigmaSq) *
+          gaussianWeightGpu(angular_squared, kInvTwoAngularSigmaSq);
+
+      weighted_normal_sum.x += sample_normal.x * weight;
+      weighted_normal_sum.y += sample_normal.y * weight;
+      weighted_normal_sum.z += sample_normal.z * weight;
+      weight_sum += weight;
+    }
+  }
+
+  if (weight_sum <= kEpsilon) {
+    normal = center_normal;
+    return true;
+  }
+
+  const float inv_weight_sum = 1.0f / weight_sum;
+  normal = normalizeVec({
+      weighted_normal_sum.x * inv_weight_sum,
+      weighted_normal_sum.y * inv_weight_sum,
+      weighted_normal_sum.z * inv_weight_sum,
+  });
+  if (normVec(normal) <= 1e-6f) {
+    normal = center_normal;
+  }
   return normVec(normal) > 1e-6f;
 }
 

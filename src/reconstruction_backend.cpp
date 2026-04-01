@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <stdexcept>
 
 #if TSDFMC_HAVE_CUDA
@@ -18,6 +19,71 @@ std::string toLower(std::string value) {
     return static_cast<char>(std::tolower(c));
   });
   return value;
+}
+
+constexpr int kDepthBilateralRadius = 2;
+constexpr float kDepthBilateralSigmaSpatial = 1.5f;
+constexpr float kDepthBilateralSigmaRange = 0.0012f;
+
+float gaussianKernel(const float squared_value, const float inv_two_sigma_sq) {
+  return std::exp(-squared_value * inv_two_sigma_sq);
+}
+
+DepthFrame applyDepthBilateralFilter(const DepthFrame& input) {
+  DepthFrame filtered(input.intrinsics);
+  if (input.intrinsics.width <= 0 || input.intrinsics.height <= 0 || input.depth.empty()) {
+    return filtered;
+  }
+
+  constexpr float kEpsilon = 1e-6f;
+  constexpr float kInvTwoSpatialSigmaSq =
+      1.0f / (2.0f * kDepthBilateralSigmaSpatial * kDepthBilateralSigmaSpatial);
+  constexpr float kInvTwoRangeSigmaSq =
+      1.0f / (2.0f * kDepthBilateralSigmaRange * kDepthBilateralSigmaRange);
+
+  for (int v = 0; v < input.intrinsics.height; ++v) {
+    for (int u = 0; u < input.intrinsics.width; ++u) {
+      const float center_depth = input.at(u, v);
+      if (center_depth <= 0.0f) {
+        filtered.at(u, v) = 0.0f;
+        continue;
+      }
+
+      float weighted_depth_sum = 0.0f;
+      float weight_sum = 0.0f;
+      for (int dv = -kDepthBilateralRadius; dv <= kDepthBilateralRadius; ++dv) {
+        const int sv = v + dv;
+        if (sv < 0 || sv >= input.intrinsics.height) {
+          continue;
+        }
+
+        for (int du = -kDepthBilateralRadius; du <= kDepthBilateralRadius; ++du) {
+          const int su = u + du;
+          if (su < 0 || su >= input.intrinsics.width) {
+            continue;
+          }
+
+          const float sample_depth = input.at(su, sv);
+          if (sample_depth <= 0.0f) {
+            continue;
+          }
+
+          const float spatial_squared = static_cast<float>(du * du + dv * dv);
+          const float depth_delta = sample_depth - center_depth;
+          const float range_squared = depth_delta * depth_delta;
+          const float weight =
+              gaussianKernel(spatial_squared, kInvTwoSpatialSigmaSq) *
+              gaussianKernel(range_squared, kInvTwoRangeSigmaSq);
+          weighted_depth_sum += weight * sample_depth;
+          weight_sum += weight;
+        }
+      }
+
+      filtered.at(u, v) = weight_sum > kEpsilon ? (weighted_depth_sum / weight_sum) : center_depth;
+    }
+  }
+
+  return filtered;
 }
 
 }  // namespace
@@ -92,13 +158,14 @@ void TsdfIntegrationBackend::integrate(VoxelHashTSDF& volume,
                                        const DepthFrame& frame,
                                        const Pose& T_wc,
                                        const int allocation_stride) const {
+  const DepthFrame filtered_frame = applyDepthBilateralFilter(frame);
   if (!use_gpu_) {
-    volume.integrate(frame, T_wc, allocation_stride);
+    volume.integrate(filtered_frame, T_wc, allocation_stride);
     return;
   }
 
 #if TSDFMC_HAVE_CUDA
-  integrateDepthFrameCuda(volume, frame, T_wc, allocation_stride);
+  integrateDepthFrameCuda(volume, filtered_frame, T_wc, allocation_stride);
 #else
   (void)frame;
   (void)T_wc;
