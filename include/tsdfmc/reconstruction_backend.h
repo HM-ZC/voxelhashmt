@@ -33,6 +33,8 @@ class TsdfIntegrationBackend {
                  const int allocation_stride) const;
 
   std::vector<Triangle> extractMesh(const VoxelHashTSDF& volume, float iso_level = 0.0f) const;
+  std::size_t blockCount(const VoxelHashTSDF& volume) const;
+  std::size_t observedVoxelCount(const VoxelHashTSDF& volume) const;
 
  private:
   bool use_gpu_ = false;
