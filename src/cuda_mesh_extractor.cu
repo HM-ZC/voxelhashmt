@@ -16,7 +16,11 @@ constexpr int kCudaBlockVolume = kCudaBlockSize * kCudaBlockSize * kCudaBlockSiz
 constexpr int kMaxTrianglesPerCube = 5;
 constexpr int kEmptyLookupIndex = -1;
 constexpr int kMaxSurfaceCandidatesPerCube = 8 * Voxel::kLayersPerDirection;
-constexpr float kLayerExtractVoxelScale = 0.35f;
+constexpr int kMinValidCornersForFallback = 6;
+constexpr float kLayerExtractVoxelScale = 0.55f;
+constexpr unsigned int kMeshThreadsX = 8U;
+constexpr unsigned int kMeshThreadsY = 4U;
+constexpr unsigned int kMeshThreadsZ = 4U;
 
 static_assert(VoxelHashTSDF::kBlockSize == kCudaBlockSize, "CUDA mesh extractor assumes 8x8x8 voxel blocks.");
 static_assert(VoxelHashTSDF::kBlockVolume == kCudaBlockVolume, "CUDA mesh extractor block volume mismatch.");
@@ -298,6 +302,59 @@ __device__ bool selectClosestLayerForSurfaceGpu(const Voxel& voxel,
   return true;
 }
 
+__device__ bool completeCubeValuesWithFallbackGpu(float values[8], unsigned int corner_valid_mask) {
+  int valid_corner_count = 0;
+  float valid_value_sum = 0.0f;
+  for (int corner = 0; corner < 8; ++corner) {
+    if ((corner_valid_mask & (1U << corner)) == 0U) {
+      continue;
+    }
+
+    ++valid_corner_count;
+    valid_value_sum += values[corner];
+  }
+
+  if (valid_corner_count == 8) {
+    return true;
+  }
+  if (valid_corner_count < kMinValidCornersForFallback) {
+    return false;
+  }
+
+  const float global_fallback =
+      valid_corner_count > 0 ? (valid_value_sum / static_cast<float>(valid_corner_count)) : 0.0f;
+  for (int corner = 0; corner < 8; ++corner) {
+    if ((corner_valid_mask & (1U << corner)) != 0U) {
+      continue;
+    }
+
+    float neighbor_sum = 0.0f;
+    int neighbor_count = 0;
+    for (int edge = 0; edge < 12; ++edge) {
+      const int c0 = c_edge_corners[edge][0];
+      const int c1 = c_edge_corners[edge][1];
+      int neighbor = -1;
+      if (c0 == corner) {
+        neighbor = c1;
+      } else if (c1 == corner) {
+        neighbor = c0;
+      }
+
+      if (neighbor < 0 || (corner_valid_mask & (1U << neighbor)) == 0U) {
+        continue;
+      }
+
+      neighbor_sum += values[neighbor];
+      ++neighbor_count;
+    }
+
+    values[corner] = neighbor_count > 0 ? (neighbor_sum / static_cast<float>(neighbor_count)) : global_fallback;
+    corner_valid_mask |= (1U << corner);
+  }
+
+  return true;
+}
+
 __device__ Vec3f interpolateVertexGpu(const Vec3f& p0,
                                       const Vec3f& p1,
                                       const float v0,
@@ -468,27 +525,29 @@ __device__ bool loadCubeForSurface(const VoxelHashTSDF::FlatBlockRecord* flat_bl
       (static_cast<float>(base_y) + 1.0f) * c_mesh_params.voxel_size,
       (static_cast<float>(base_z) + 1.0f) * c_mesh_params.voxel_size,
   };
+  unsigned int corner_valid_mask = 0U;
 
   for (int corner = 0; corner < 8; ++corner) {
     const int vx = base_x + c_corner_offsets[corner][0];
     const int vy = base_y + c_corner_offsets[corner][1];
     const int vz = base_z + c_corner_offsets[corner][2];
+    positions[corner] = voxelCoordToWorld(vx, vy, vz);
 
     Voxel voxel{};
     if (!fetchVoxel(flat_blocks, lookup_table, vx, vy, vz, voxel)) {
-      return false;
+      continue;
     }
 
     DirectionalTsdfLayer layer{};
     if (!selectClosestLayerForSurfaceGpu(voxel, direction_index, surface_key, cell_center, match_tolerance, layer)) {
-      return false;
+      continue;
     }
 
-    positions[corner] = voxelCoordToWorld(vx, vy, vz);
     values[corner] = planeSignedDistanceGpu(layer, positions[corner]);
+    corner_valid_mask |= (1U << corner);
   }
 
-  return true;
+  return completeCubeValuesWithFallbackGpu(values, corner_valid_mask);
 }
 
 __global__ void countTrianglesKernel(const VoxelHashTSDF::FlatBlockRecord* flat_blocks,
@@ -498,25 +557,27 @@ __global__ void countTrianglesKernel(const VoxelHashTSDF::FlatBlockRecord* flat_
   if (block_index >= c_mesh_params.num_blocks) {
     return;
   }
-
-  const int lx = static_cast<int>(threadIdx.x);
-  const int ly = static_cast<int>(threadIdx.y);
-  const int lz = static_cast<int>(threadIdx.z);
-
   const BlockKey block_key = flat_blocks[block_index].key;
-  float cluster_centers[kMaxSurfaceCandidatesPerCube];
-  const int cluster_count = collectSurfaceClusters(flat_blocks, lookup_table, block_key, lx, ly, lz, cluster_centers);
-  for (int cluster_index = 0; cluster_index < cluster_count; ++cluster_index) {
-    Vec3f positions[8];
-    float values[8];
-    if (!loadCubeForSurface(
-            flat_blocks, lookup_table, block_key, lx, ly, lz, cluster_centers[cluster_index], positions, values)) {
-      continue;
-    }
+  for (int lx = static_cast<int>(threadIdx.x); lx < kCudaBlockSize; lx += static_cast<int>(blockDim.x)) {
+    for (int ly = static_cast<int>(threadIdx.y); ly < kCudaBlockSize; ly += static_cast<int>(blockDim.y)) {
+      for (int lz = static_cast<int>(threadIdx.z); lz < kCudaBlockSize; lz += static_cast<int>(blockDim.z)) {
+        float cluster_centers[kMaxSurfaceCandidatesPerCube];
+        const int cluster_count =
+            collectSurfaceClusters(flat_blocks, lookup_table, block_key, lx, ly, lz, cluster_centers);
+        for (int cluster_index = 0; cluster_index < cluster_count; ++cluster_index) {
+          Vec3f positions[8];
+          float values[8];
+          if (!loadCubeForSurface(
+                  flat_blocks, lookup_table, block_key, lx, ly, lz, cluster_centers[cluster_index], positions, values)) {
+            continue;
+          }
 
-    const int triangle_count = countCubeTriangles(values, c_mesh_params.iso_level);
-    if (triangle_count > 0) {
-      atomicAdd(total_triangles, static_cast<unsigned int>(triangle_count));
+          const int triangle_count = countCubeTriangles(values, c_mesh_params.iso_level);
+          if (triangle_count > 0) {
+            atomicAdd(total_triangles, static_cast<unsigned int>(triangle_count));
+          }
+        }
+      }
     }
   }
 }
@@ -531,37 +592,41 @@ __global__ void extractTrianglesKernel(const VoxelHashTSDF::FlatBlockRecord* fla
     return;
   }
 
-  const int lx = static_cast<int>(threadIdx.x);
-  const int ly = static_cast<int>(threadIdx.y);
-  const int lz = static_cast<int>(threadIdx.z);
-
   const BlockKey block_key = flat_blocks[block_index].key;
-  float cluster_centers[kMaxSurfaceCandidatesPerCube];
-  const int cluster_count = collectSurfaceClusters(flat_blocks, lookup_table, block_key, lx, ly, lz, cluster_centers);
-  for (int cluster_index = 0; cluster_index < cluster_count; ++cluster_index) {
-    Vec3f positions[8];
-    float values[8];
-    if (!loadCubeForSurface(
-            flat_blocks, lookup_table, block_key, lx, ly, lz, cluster_centers[cluster_index], positions, values)) {
-      continue;
-    }
+  for (int lx = static_cast<int>(threadIdx.x); lx < kCudaBlockSize; lx += static_cast<int>(blockDim.x)) {
+    for (int ly = static_cast<int>(threadIdx.y); ly < kCudaBlockSize; ly += static_cast<int>(blockDim.y)) {
+      for (int lz = static_cast<int>(threadIdx.z); lz < kCudaBlockSize; lz += static_cast<int>(blockDim.z)) {
+        float cluster_centers[kMaxSurfaceCandidatesPerCube];
+        const int cluster_count =
+            collectSurfaceClusters(flat_blocks, lookup_table, block_key, lx, ly, lz, cluster_centers);
+        for (int cluster_index = 0; cluster_index < cluster_count; ++cluster_index) {
+          Vec3f positions[8];
+          float values[8];
+          if (!loadCubeForSurface(
+                  flat_blocks, lookup_table, block_key, lx, ly, lz, cluster_centers[cluster_index], positions, values)) {
+            continue;
+          }
 
-    Triangle local_triangles[kMaxTrianglesPerCube];
-    const int triangle_count = emitCubeTriangles(positions, values, c_mesh_params.iso_level, local_triangles);
-    if (triangle_count <= 0) {
-      continue;
-    }
+          Triangle local_triangles[kMaxTrianglesPerCube];
+          const int triangle_count = emitCubeTriangles(positions, values, c_mesh_params.iso_level, local_triangles);
+          if (triangle_count <= 0) {
+            continue;
+          }
 
-    const unsigned int base = atomicAdd(triangle_counter, static_cast<unsigned int>(triangle_count));
-    if (base >= max_triangles) {
-      continue;
-    }
+          const unsigned int base = atomicAdd(triangle_counter, static_cast<unsigned int>(triangle_count));
+          if (base >= max_triangles) {
+            continue;
+          }
 
-    const unsigned int remaining = max_triangles - base;
-    const unsigned int writable =
-        static_cast<unsigned int>(triangle_count) < remaining ? static_cast<unsigned int>(triangle_count) : remaining;
-    for (unsigned int i = 0; i < writable; ++i) {
-      triangles[base + i] = local_triangles[i];
+          const unsigned int remaining = max_triangles - base;
+          const unsigned int writable = static_cast<unsigned int>(triangle_count) < remaining
+                                            ? static_cast<unsigned int>(triangle_count)
+                                            : remaining;
+          for (unsigned int i = 0; i < writable; ++i) {
+            triangles[base + i] = local_triangles[i];
+          }
+        }
+      }
     }
   }
 }
@@ -600,7 +665,7 @@ std::vector<Triangle> extractMeshCuda(const VoxelHashTSDF& volume, const float i
   }
   workspace.lookup_table.copyFromHost(lookup_table.data(), lookup_table.size());
 
-  const dim3 block_size(kCudaBlockSize, kCudaBlockSize, kCudaBlockSize);
+  const dim3 block_size(kMeshThreadsX, kMeshThreadsY, kMeshThreadsZ);
   const dim3 grid_size(static_cast<unsigned int>(block_keys.size()), 1, 1);
   std::vector<Triangle> triangles;
   unsigned int zero = 0;

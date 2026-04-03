@@ -26,7 +26,7 @@ struct Voxel {
   // Keep the total slot count unchanged versus the previous 3x4 layout:
   // we now separate opposite-facing surfaces into signed dominant-direction bins.
   static constexpr int kDirectionalBins = 6;
-  static constexpr int kLayersPerDirection = 2;
+  static constexpr int kLayersPerDirection = 3;
   DirectionalTsdfLayer layers[kDirectionalBins][kLayersPerDirection]{};
 };
 
@@ -200,7 +200,7 @@ class VoxelHashTSDF {
   static constexpr float kDepthDiscontinuityBase = 0.0012f;
   static constexpr float kDepthDiscontinuityRelative = 0.0025f;
   static constexpr float kLayerMergeVoxelScale = 0.25f;
-  static constexpr float kLayerExtractVoxelScale = 0.35f;
+  static constexpr float kLayerExtractVoxelScale = 0.55f;
   static constexpr float kLayerNormalConsistencyCosine = 0.75f;
 
   static bool blockHasObservedVoxels(const Block& block) {
@@ -417,6 +417,62 @@ class VoxelHashTSDF {
       return false;
     }
     layer_out = layers[best_index];
+    return true;
+  }
+
+  static bool completeCubeValuesWithFallback(std::array<float, 8>& values,
+                                             std::array<std::uint8_t, 8>& corner_valid) {
+    int valid_corner_count = 0;
+    float valid_value_sum = 0.0f;
+    for (std::size_t corner = 0; corner < corner_valid.size(); ++corner) {
+      if (corner_valid[corner] == 0U) {
+        continue;
+      }
+      ++valid_corner_count;
+      valid_value_sum += values[corner];
+    }
+
+    if (valid_corner_count == static_cast<int>(corner_valid.size())) {
+      return true;
+    }
+
+    constexpr int kMinValidCornersForFallback = 6;
+    if (valid_corner_count < kMinValidCornersForFallback) {
+      return false;
+    }
+
+    const float global_fallback =
+        valid_corner_count > 0 ? (valid_value_sum / static_cast<float>(valid_corner_count)) : 0.0f;
+    for (int corner = 0; corner < static_cast<int>(corner_valid.size()); ++corner) {
+      if (corner_valid[static_cast<std::size_t>(corner)] != 0U) {
+        continue;
+      }
+
+      float neighbor_sum = 0.0f;
+      int neighbor_count = 0;
+      for (int edge = 0; edge < 12; ++edge) {
+        const int c0 = kEdgeCorners[edge][0];
+        const int c1 = kEdgeCorners[edge][1];
+        int neighbor = -1;
+        if (c0 == corner) {
+          neighbor = c1;
+        } else if (c1 == corner) {
+          neighbor = c0;
+        }
+
+        if (neighbor < 0 || corner_valid[static_cast<std::size_t>(neighbor)] == 0U) {
+          continue;
+        }
+
+        neighbor_sum += values[static_cast<std::size_t>(neighbor)];
+        ++neighbor_count;
+      }
+
+      values[static_cast<std::size_t>(corner)] =
+          neighbor_count > 0 ? (neighbor_sum / static_cast<float>(neighbor_count)) : global_fallback;
+      corner_valid[static_cast<std::size_t>(corner)] = 1U;
+    }
+
     return true;
   }
 
@@ -853,25 +909,24 @@ class VoxelHashTSDF {
             for (int cluster_index = 0; cluster_index < cluster_count; ++cluster_index) {
               const float surface_key = cluster_centers[static_cast<std::size_t>(cluster_index)];
               std::array<float, 8> values{};
-              bool valid_cube = true;
+              std::array<std::uint8_t, 8> corner_valid{};
               for (std::size_t corner = 0; corner < kCubeCornerOffsets.size(); ++corner) {
                 const Vec3i sample_coord = cell_origin + kCubeCornerOffsets[corner];
                 const Voxel* voxel = findVoxel(sample_coord);
                 if (voxel == nullptr) {
-                  valid_cube = false;
-                  break;
+                  continue;
                 }
 
                 DirectionalTsdfLayer layer{};
                 if (!selectClosestLayerForSurface(*voxel, direction_index, surface_key, cell_center, match_tolerance,
                                                  layer)) {
-                  valid_cube = false;
-                  break;
+                  continue;
                 }
                 values[corner] = planeSignedDistance(layer, positions[corner]);
+                corner_valid[corner] = 1U;
               }
 
-              if (!valid_cube) {
+              if (!completeCubeValuesWithFallback(values, corner_valid)) {
                 continue;
               }
 
