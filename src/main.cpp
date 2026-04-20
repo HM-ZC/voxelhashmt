@@ -447,8 +447,8 @@ int runSyntheticDemo(const Options& options) {
               << " rendered in " << formatMilliseconds(render_elapsed)
               << ", integrated in " << formatMilliseconds(integrate_elapsed)
               << ", total=" << formatMilliseconds(frame_elapsed)
-              << ", active blocks=" << volume.blockCount()
-              << ", observed voxels=" << volume.observedVoxelCount() << '\n';
+              << ", active blocks=" << integration_backend.blockCount(volume)
+              << ", observed voxels=" << integration_backend.observedVoxelCount(volume) << '\n';
   }
 
   const Clock::time_point mesh_start = Clock::now();
@@ -468,8 +468,8 @@ int runSyntheticDemo(const Options& options) {
   const Milliseconds total_elapsed = Clock::now() - process_start;
 
   std::cout << "Mesh written to " << output_path << '\n';
-  std::cout << "Final stats: blocks=" << volume.blockCount()
-            << ", observed voxels=" << volume.observedVoxelCount()
+  std::cout << "Final stats: blocks=" << integration_backend.blockCount(volume)
+            << ", observed voxels=" << integration_backend.observedVoxelCount(volume)
             << ", raw triangles=" << triangles.size() << '\n';
   std::cout << "Timing summary: render=" << formatMilliseconds(render_total)
             << ", integrate=" << formatMilliseconds(integrate_total)
@@ -558,8 +558,8 @@ int runDatasetReconstruction(const Options& options) {
               << ", load=" << formatMilliseconds(load_elapsed)
               << ", integrate=" << formatMilliseconds(integrate_elapsed)
               << ", total=" << formatMilliseconds(frame_elapsed)
-              << ", active blocks=" << volume.blockCount()
-              << ", observed voxels=" << volume.observedVoxelCount() << '\n';
+              << ", active blocks=" << integration_backend.blockCount(volume)
+              << ", observed voxels=" << integration_backend.observedVoxelCount(volume) << '\n';
   }
 
   std::cout << "Extracting mesh with marching cubes...\n";
@@ -580,8 +580,8 @@ int runDatasetReconstruction(const Options& options) {
   const Milliseconds total_elapsed = Clock::now() - process_start;
 
   std::cout << "Mesh written to " << output_path << '\n';
-  std::cout << "Final stats: blocks=" << volume.blockCount()
-            << ", observed voxels=" << volume.observedVoxelCount()
+  std::cout << "Final stats: blocks=" << integration_backend.blockCount(volume)
+            << ", observed voxels=" << integration_backend.observedVoxelCount(volume)
             << ", raw triangles=" << triangles.size() << '\n';
   std::cout << "Timing summary: frame_load=" << formatMilliseconds(load_total)
             << ", integrate=" << formatMilliseconds(integrate_total)

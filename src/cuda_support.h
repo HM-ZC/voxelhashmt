@@ -36,13 +36,16 @@ class ReusableDeviceBuffer {
       return;
     }
 
-    if (data_ != nullptr) {
+    T* new_data = nullptr;
+    throwCudaError(cudaMalloc(reinterpret_cast<void**>(&new_data), count * sizeof(T)), "cudaMalloc");
+    if (data_ != nullptr && capacity_ > 0) {
+      throwCudaError(
+          cudaMemcpy(new_data, data_, capacity_ * sizeof(T), cudaMemcpyDeviceToDevice),
+          "cudaMemcpy D2D");
       cudaFree(data_);
-      data_ = nullptr;
-      capacity_ = 0;
     }
 
-    throwCudaError(cudaMalloc(reinterpret_cast<void**>(&data_), count * sizeof(T)), "cudaMalloc");
+    data_ = new_data;
     capacity_ = count;
   }
 
